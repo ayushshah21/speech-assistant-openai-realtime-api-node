@@ -1,89 +1,86 @@
-#  Speech Assistant with Twilio Voice and the OpenAI Realtime API (Node.js)
+# Speech Assistant with OpenAI Realtime API and Twilio
 
-This application demonstrates how to use Node.js, [Twilio Voice](https://www.twilio.com/docs/voice) and [Media Streams](https://www.twilio.com/docs/voice/media-streams), and [OpenAI's Realtime API](https://platform.openai.com/docs/) to make a phone call to speak with an AI Assistant. 
-
-The application opens websockets with the OpenAI Realtime API and Twilio, and sends voice audio from one to the other to enable a two-way conversation.
-
-See [here](https://www.twilio.com/en-us/blog/voice-ai-assistant-openai-realtime-api-node) for a tutorial overview of the code.
-
-This application uses the following Twilio products in conjuction with OpenAI's Realtime API:
-- Voice (and TwiML, Media Streams)
-- Phone Numbers
-
-> [!NOTE]
-> Outbound calling is beyond the scope of this app. However, we demoed [one way to do it here](https://www.twilio.com/en-us/blog/outbound-calls-node-openai-realtime-api-voice).
+This project implements a voice assistant using OpenAI's Realtime API and Twilio for handling phone calls. The assistant can engage in real-time conversations, understand speech, and respond naturally.
 
 ## Prerequisites
 
-To use the app, you will  need:
+- Node.js (v16 or higher)
+- npm
+- OpenAI API key
+- Twilio account with credentials
+- ngrok for local development
 
-- **Node.js 18+** We used \`18.20.4\` for development; download from [here](https://nodejs.org/).
-- **A Twilio account.** You can sign up for a free trial [here](https://www.twilio.com/try-twilio).
-- **A Twilio number with _Voice_ capabilities.** [Here are instructions](https://help.twilio.com/articles/223135247-How-to-Search-for-and-Buy-a-Twilio-Phone-Number-from-Console) to purchase a phone number.
-- **An OpenAI account and an OpenAI API Key.** You can sign up [here](https://platform.openai.com/).
-  - **OpenAI Realtime API access.**
+## Environment Setup
 
-## Local Setup
+1. Clone the repository
+2. Install dependencies:
+   ```bash
+   npm install
+   ```
+3. Copy `.env.example` to `.env` and fill in your credentials:
+   ```
+   OPENAI_API_KEY=your_openai_api_key
+   TWILIO_ACCOUNT_SID=your_twilio_account_sid
+   TWILIO_AUTH_TOKEN=your_twilio_auth_token
+   TWILIO_PHONE_NUMBER=your_twilio_phone_number
+   PORT=5050
+   ```
 
-There are 4 required steps to get the app up-and-running locally for development and testing:
-1. Run ngrok or another tunneling solution to expose your local server to the internet for testing. Download ngrok [here](https://ngrok.com/).
-2. Install the packages
-3. Twilio setup
-4. Update the .env file
+## Development
 
-### Open an ngrok tunnel
-When developing & testing locally, you'll need to open a tunnel to forward requests to your local development server. These instructions use ngrok.
+The project uses TypeScript and includes hot-reloading for development. To start development:
 
-Open a Terminal and run:
+1. Build the TypeScript files:
+   ```bash
+   npm run build
+   ```
+
+2. In one terminal, start the ngrok tunnel:
+   ```bash
+   npm run tunnel
+   ```
+   Copy the ngrok URL and update your Twilio webhook settings to point to:
+   - Voice Webhook: `{ngrok-url}/incoming-call`
+
+3. In another terminal, start the development server with hot-reloading:
+   ```bash
+   npm run dev:server
+   ```
+
+## Project Structure
+
+- `src/index.ts` - Main application file
+- `src/server.ts` - Server setup and configuration
+- `src/responseGenerator.ts` - Response generation logic
+- `src/kayakoService.ts` - Kayako API integration
+
+## Features
+
+- Real-time voice conversations using OpenAI's Realtime API
+- Twilio integration for phone call handling
+- WebSocket-based media streaming
+- TypeScript support
+- Hot-reloading during development
+- ngrok integration for local development
+
+## Production
+
+To run in production:
+
+```bash
+npm run prod
 ```
-ngrok http 5050
-```
-Once the tunnel has been opened, copy the `Forwarding` URL. It will look something like: `https://[your-ngrok-subdomain].ngrok.app`. You will
-need this when configuring your Twilio number setup.
 
-Note that the `ngrok` command above forwards to a development server running on port `5050`, which is the default port configured in this application. If
-you override the `PORT` defined in `index.js`, you will need to update the `ngrok` command accordingly.
+This will build the TypeScript files and start the server.
 
-Keep in mind that each time you run the `ngrok http` command, a new URL will be created, and you'll need to update it everywhere it is referenced below.
+## Available Scripts
 
-### Install required packages
+- `npm run build` - Build TypeScript files
+- `npm run dev:server` - Start development server with hot-reloading
+- `npm run tunnel` - Start ngrok tunnel for local development
+- `npm run prod` - Build and start in production mode
+- `npm start` - Start the server (without building)
 
-Open a Terminal and run:
-```
-npm install
-```
+## License
 
-### Twilio setup
-
-#### Point a Phone Number to your ngrok URL
-In the [Twilio Console](https://console.twilio.com/), go to **Phone Numbers** > **Manage** > **Active Numbers** and click on the additional phone number you purchased for this app in the **Prerequisites**.
-
-In your Phone Number configuration settings, update the first **A call comes in** dropdown to **Webhook**, and paste your ngrok forwarding URL (referenced above), followed by `/incoming-call`. For example, `https://[your-ngrok-subdomain].ngrok.app/incoming-call`. Then, click **Save configuration**.
-
-### Update the .env file
-
-Create a `/env` file, or copy the `.env.example` file to `.env`:
-
-```
-cp .env.example .env
-```
-
-In the .env file, update the `OPENAI_API_KEY` to your OpenAI API key from the **Prerequisites**.
-
-## Run the app
-Once ngrok is running, dependencies are installed, Twilio is configured properly, and the `.env` is set up, run the dev server with the following command:
-```
-node index.js
-```
-## Test the app
-With the development server running, call the phone number you purchased in the **Prerequisites**. After the introduction, you should be able to talk to the AI Assistant. Have fun!
-
-## Special features
-
-### Have the AI speak first
-To have the AI voice assistant talk before the user, uncomment the line `// sendInitialConversationItem();`. The initial greeting is controlled in `sendInitialConversationItem`.
-
-### Interrupt handling/AI preemption
-When the user speaks and OpenAI sends `input_audio_buffer.speech_started`, the code will clear the Twilio Media Streams buffer and send OpenAI `conversation.item.truncate`.
-
-Depending on your application's needs, you may want to use the [`input_audio_buffer.speech_stopped`](https://platform.openai.com/docs/api-reference/realtime-server-events/input_audio_buffer/speech_stopped) event, instead.
+ISC

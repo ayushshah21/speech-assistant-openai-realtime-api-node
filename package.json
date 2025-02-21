@@ -2,19 +2,32 @@
   "name": "speech-assistant-openai-realtime-api-node",
   "version": "1.0.1",
   "description": "",
-  "main": "index.js",
+  "main": "dist/index.js",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev:server": "NODE_ENV=development node --loader ts-node/esm src/index.ts",
+    "tunnel": "ngrok http 3000",
+    "prod": "npm run build && npm start"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "module",
   "dependencies": {
     "@fastify/formbody": "^8.0.0",
     "@fastify/websocket": "^11.0.0",
     "dotenv": "^16.4.5",
     "fastify": "^5.0.0",
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.19",
+    "@types/ws": "^8.5.10",
+    "concurrently": "^8.2.2",
+    "ngrok": "^5.0.0-beta.2",
+    "nodemon": "^3.0.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
   }
 }
