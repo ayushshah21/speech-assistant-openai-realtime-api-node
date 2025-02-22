@@ -3,6 +3,8 @@ import WebSocket from 'ws';
 import dotenv from 'dotenv';
 import fastifyFormBody from '@fastify/formbody';
 import fastifyWs from '@fastify/websocket';
+import fs from 'fs';
+import path from 'path';
 
 // Load environment variables
 dotenv.config();
@@ -15,6 +17,88 @@ for (const envVar of requiredEnvVars) {
         process.exit(1);
     }
 }
+
+// Knowledge base interfaces
+interface KnowledgeArticle {
+    id: string;
+    title: string;
+    category: string;
+    content: {
+        overview: string;
+        solution?: string[];
+        steps?: string[];
+        important_notes?: string | string[];
+        [key: string]: any;
+    };
+    faq: Array<{
+        question: string;
+        answer: string;
+    }>;
+}
+
+interface KnowledgeBase {
+    articles: KnowledgeArticle[];
+    [key: string]: any;
+}
+
+// Load knowledge base
+const kbPath = path.join(process.cwd(), 'src', 'knowledge_base.json');
+const kbData = fs.readFileSync(kbPath, 'utf-8');
+const knowledgeBase: KnowledgeBase = JSON.parse(kbData);
+
+/**
+ * Creates a concise context from the knowledge base for the AI
+ */
+function buildKnowledgeBaseContext(): string {
+    const articles = knowledgeBase.articles.map(article => {
+        const parts = [
+            `TITLE: ${article.title}`,
+            `OVERVIEW: ${article.content.overview}`
+        ];
+
+        // Add solution steps if present
+        if (article.content.solution) {
+            parts.push(`SOLUTION: ${article.content.solution.join('; ')}`);
+        }
+
+        // Add important notes
+        if (article.content.important_notes) {
+            const notes = Array.isArray(article.content.important_notes)
+                ? article.content.important_notes.join('; ')
+                : article.content.important_notes;
+            parts.push(`NOTES: ${notes}`);
+        }
+
+        // Add first FAQ as example
+        if (article.faq?.length > 0) {
+            const faq = article.faq[0];
+            parts.push(`FAQ: Q: ${faq.question} A: ${faq.answer}`);
+        }
+
+        return parts.join('\n');
+    });
+
+    return articles.join('\n\n');
+}
+
+// Build knowledge base context once at startup
+const KNOWLEDGE_BASE_CONTEXT = buildKnowledgeBaseContext();
+
+// System message that enforces staying on topic
+const SYSTEM_MESSAGE = `You are a Kayako AI support assistant. You have access to the following knowledge base about Kayako's products and services:
+
+${KNOWLEDGE_BASE_CONTEXT}
+
+IMPORTANT GUIDELINES:
+1. ONLY answer questions related to Kayako's products and services
+2. If a user asks about anything not related to Kayako, respond with:
+   "I'm specifically trained to help with Kayako's products and services. What would you like to know about Kayako?"
+3. Keep responses concise and friendly
+4. Use the knowledge base information to provide accurate answers
+5. If you don't find a specific answer in the knowledge base, say:
+   "I don't have specific information about that aspect of Kayako. Would you like me to connect you with a support specialist?"
+
+Remember: Your purpose is to help users with Kayako-related questions only.`;
 
 interface OpenAISessionUpdate {
     type: 'session.update';
@@ -80,9 +164,9 @@ fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
 // Constants
-const SYSTEM_MESSAGE = 'You are a helpful and bubbly AI assistant ... rickrolling – subtly.';
 const VOICE = 'alloy';
 const PORT = process.env.PORT || 5050;
+const MAX_CHUNK_SIZE = 8192; // Maximum size for Twilio audio chunks
 
 const LOG_EVENT_TYPES = [
     'error',
@@ -107,9 +191,7 @@ fastify.all('/voice', async (request: FastifyRequest, reply: FastifyReply) => {
     console.log('Received voice call webhook:', request.body);
     const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
-      <Say>Please wait while we connect your call to the AI voice assistant...</Say>
-      <Pause length="1"/>
-      <Say>OK, you can start talking!</Say>
+      <Say>Welcome to Kayako support. How can I assist you today?</Say>
       <Connect>
         <Stream url="wss://${request.headers.host}/media-stream" />
       </Connect>
@@ -119,7 +201,6 @@ fastify.all('/voice', async (request: FastifyRequest, reply: FastifyReply) => {
 
 // WebSocket route for /media-stream
 fastify.register(async (fastify: FastifyInstance) => {
-    // NOTE: the 'connection' param is now typed as the raw 'WebSocket' object directly
     fastify.get('/media-stream', { websocket: true }, (connection: WebSocket, req) => {
         console.log('Client connected');
 
@@ -129,6 +210,7 @@ fastify.register(async (fastify: FastifyInstance) => {
         let markQueue: string[] = [];
         let responseStartTimestampTwilio: number | null = null;
         let lastSpeechStartTime = 0;
+        let isResponseFullyDone = false;  // Track if response.done has fired
 
         const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01', {
             headers: {
@@ -137,107 +219,62 @@ fastify.register(async (fastify: FastifyInstance) => {
             },
         });
 
+        // Helper function to send silence buffer
+        function sendSilence() {
+            if (!streamSid) return;
+            // 160 frames of 0xFF is ~500ms g711 silence
+            const silence = Buffer.alloc(160, 0xFF).toString('base64');
+
+            // Send silence in chunks to avoid Twilio's 8192 byte limit
+            let offset = 0;
+            while (offset < silence.length) {
+                const slice = silence.slice(offset, offset + MAX_CHUNK_SIZE);
+                offset += MAX_CHUNK_SIZE;
+                connection.send(JSON.stringify({
+                    event: 'media',
+                    streamSid: streamSid,
+                    media: { payload: slice }
+                }));
+            }
+
+            // Mark the silence
+            connection.send(JSON.stringify({
+                event: 'mark',
+                streamSid: streamSid,
+                mark: { name: 'endSilence' }
+            }));
+
+            console.log('Sent final silence buffer');
+        }
+
         const initializeSession = (): void => {
             const sessionUpdate: OpenAISessionUpdate = {
                 type: 'session.update',
                 session: {
                     turn_detection: {
                         type: 'server_vad',
-                        threshold: 0.6,                // Increased from default 0.5 for better noise handling
+                        threshold: 0.6,                // Higher threshold for better noise handling
                         prefix_padding_ms: 300,
-                        silence_duration_ms: 800,      // Increased from default 200 for longer pauses
+                        silence_duration_ms: 800,      // Longer pause detection for natural conversation
                         create_response: true,
-                        interrupt_response: true
+                        interrupt_response: true       // Allow interrupting for better flow
                     },
                     input_audio_format: 'g711_ulaw',
                     output_audio_format: 'g711_ulaw',
                     voice: VOICE,
-                    instructions: SYSTEM_MESSAGE,
+                    instructions: SYSTEM_MESSAGE,      // Using our enhanced system message with KB context
                     modalities: ['text', 'audio'],
-                    temperature: 0.8,
+                    temperature: 0.7,                  // Lower temperature for more focused responses
                 },
             };
-            console.log('Sending session update:', JSON.stringify(sessionUpdate));
+            console.log('Initializing OpenAI session with Kayako knowledge base context');
             openAiWs.send(JSON.stringify(sessionUpdate));
-        };
-
-        // Example if you want AI to greet first
-        const sendInitialConversationItem = (): void => {
-            const initialConversation: OpenAIConversationItem = {
-                type: 'conversation.item.create',
-                item: {
-                    type: 'message',
-                    role: 'user',
-                    content: [
-                        {
-                            type: 'input_text',
-                            text: 'Greet the user with "Hello there! ... How can I help you?"',
-                        },
-                    ],
-                },
-            };
-            if (SHOW_TIMING_MATH) {
-                console.log('Sending initial conversation item:', JSON.stringify(initialConversation));
-            }
-            openAiWs.send(JSON.stringify(initialConversation));
-            openAiWs.send(JSON.stringify({ type: 'response.create' }));
-        };
-
-        const handleSpeechStartedEvent = (): void => {
-            // Add debounce to prevent rapid start/stop
-            if (Date.now() - lastSpeechStartTime < 500) {
-                return;
-            }
-            lastSpeechStartTime = Date.now();
-
-            if (markQueue.length > 0 && responseStartTimestampTwilio !== null) {
-                const elapsedTime = latestMediaTimestamp - responseStartTimestampTwilio;
-                if (SHOW_TIMING_MATH) {
-                    console.log(`Truncation: ${latestMediaTimestamp} - ${responseStartTimestampTwilio} = ${elapsedTime}ms`);
-                }
-                // Only truncate if significant time has passed
-                if (elapsedTime > 1000) {
-                    if (lastAssistantItem) {
-                        const truncateEvent: OpenAITruncateEvent = {
-                            type: 'conversation.item.truncate',
-                            item_id: lastAssistantItem,
-                            content_index: 0,
-                            audio_end_ms: elapsedTime,
-                        };
-                        if (SHOW_TIMING_MATH) console.log('Sending truncation event:', JSON.stringify(truncateEvent));
-                        openAiWs.send(JSON.stringify(truncateEvent));
-                    }
-                    // Clear Twilio's queued audio
-                    connection.send(
-                        JSON.stringify({
-                            event: 'clear',
-                            streamSid: streamSid,
-                        })
-                    );
-                    markQueue = [];
-                    lastAssistantItem = null;
-                    responseStartTimestampTwilio = null;
-                }
-            }
-        };
-
-        const sendMark = (ws: WebSocket, sSid: string): void => {
-            if (sSid) {
-                const markEvent = {
-                    event: 'mark',
-                    streamSid: sSid,
-                    mark: { name: 'responsePart' },
-                };
-                ws.send(JSON.stringify(markEvent));
-                markQueue.push('responsePart');
-            }
         };
 
         // OpenAI WebSocket events
         openAiWs.on('open', () => {
             console.log('Connected to OpenAI Realtime API');
             setTimeout(initializeSession, 100);
-            // sendInitialConversationItem(); // optional
         });
 
         openAiWs.on('message', (rawData: WebSocket.Data) => {
@@ -257,15 +294,31 @@ fastify.register(async (fastify: FastifyInstance) => {
 
                     if (!responseStartTimestampTwilio) {
                         responseStartTimestampTwilio = latestMediaTimestamp;
-                        if (SHOW_TIMING_MATH) {
-                            console.log(`Set responseStartTimestamp: ${responseStartTimestampTwilio}ms`);
-                        }
                     }
 
                     if (response.item_id) {
                         lastAssistantItem = response.item_id;
                     }
                     sendMark(connection, streamSid!);
+                }
+
+                // Track response.audio.done
+                if (response.type === 'response.audio.done') {
+                    console.log('AI audio done => waiting for complete response.done');
+                }
+
+                // Handle complete response
+                if (response.type === 'response.done') {
+                    console.log('AI response fully done => sending final silence');
+                    isResponseFullyDone = true;
+                    if (streamSid) {
+                        // Send final silence buffer
+                        sendSilence();
+                        // Wait ~1s for Twilio to play it
+                        setTimeout(() => {
+                            console.log('Final silence played => response complete');
+                        }, 1000);
+                    }
                 }
 
                 if (response.type === 'input_audio_buffer.speech_started') {
@@ -345,6 +398,45 @@ fastify.register(async (fastify: FastifyInstance) => {
                 console.error('Failed to send error to Twilio:', e);
             }
         });
+
+        // Helper function to send marks to Twilio
+        const sendMark = (ws: WebSocket, sSid: string): void => {
+            if (sSid) {
+                const markEvent = {
+                    event: 'mark',
+                    streamSid: sSid,
+                    mark: { name: 'responsePart' },
+                };
+                ws.send(JSON.stringify(markEvent));
+                markQueue.push('responsePart');
+            }
+        };
+
+        // Handle speech started events with debounce
+        const handleSpeechStartedEvent = (): void => {
+            if (Date.now() - lastSpeechStartTime < 500) return;
+            lastSpeechStartTime = Date.now();
+
+            if (lastAssistantItem) {
+                // Truncate AI response
+                openAiWs.send(JSON.stringify({
+                    type: 'conversation.item.truncate',
+                    item_id: lastAssistantItem,
+                    content_index: 0,
+                    audio_end_ms: 0
+                }));
+                console.log('Barge-in: truncated AI response');
+                lastAssistantItem = null;
+
+                // Clear Twilio's queued audio
+                if (streamSid) {
+                    connection.send(JSON.stringify({
+                        event: 'clear',
+                        streamSid: streamSid
+                    }));
+                }
+            }
+        };
     });
 });
 
