@@ -5,6 +5,11 @@ import fastifyFormBody from '@fastify/formbody';
 import fastifyWs from '@fastify/websocket';
 import fs from 'fs';
 import path from 'path';
+import { createCallRecorder, CallRecorder } from './call-recorder.js';
+import FormData from 'form-data';
+import { OpenAI } from 'openai';
+import https from 'https';
+import http from 'http';
 
 // Load environment variables
 dotenv.config();
@@ -111,10 +116,10 @@ interface OpenAISessionUpdate {
     type: 'session.update';
     session: {
         turn_detection: {
-            type: string;
-            threshold?: number;
-            prefix_padding_ms?: number;
-            silence_duration_ms?: number;
+            type: string;               // 'server_vad'
+            threshold?: number;         // e.g. 0.5 or 0.6
+            prefix_padding_ms?: number; // e.g. 300
+            silence_duration_ms?: number; // e.g. 200 or 800
             create_response?: boolean;
             interrupt_response?: boolean;
         };
@@ -162,8 +167,6 @@ fastify.register(fastifyWs);
 const VOICE = 'alloy';
 const PORT = process.env.PORT || 5050;
 const MAX_CHUNK_SIZE = 8192; // Maximum for Twilio audio
-
-// Utility variables
 const SHOW_TIMING_MATH = false;
 
 // User + conversation state
@@ -174,11 +177,39 @@ interface UserDetails {
     hasProvidedEmail: boolean;
 }
 
+enum ConfidenceLevel {
+    HIGH = 'high',
+    MEDIUM = 'medium',
+    LOW = 'low'
+}
+
+interface SpeechSegment {
+    id: string;
+    startTime: number;
+    endTime: number | null;
+    transcription: string;
+    confidence: number;
+    isFinal: boolean;
+    audioPayloads: string[];
+}
+
 interface ConversationState {
     transcript: Array<{
         role: 'user' | 'assistant';
         content: string;
         timestamp: number;
+        confidence?: number;
+        level?: ConfidenceLevel;
+    }>;
+    rawUserInput: Array<{
+        content: string;
+        timestamp: number;
+        confidence?: number;
+        is_final?: boolean;
+        duration?: number;
+        start_time?: string;
+        end_time?: string;
+        level?: ConfidenceLevel;
     }>;
     userDetails: UserDetails;
     kbMatchFound: boolean;
@@ -191,7 +222,7 @@ interface KayakoTicket {
         product: string;
     };
     status_id: string;
-    attachment_file_ids: string;
+    attachment_file_ids: string[];
     tags: string;
     type_id: number;
     channel: string;
@@ -206,6 +237,12 @@ interface KayakoTicket {
         cc: string[];
         html: boolean;
     };
+}
+
+// Add this interface with the other interfaces
+interface KayakoAttachmentResponse {
+    id: string;
+    [key: string]: any;
 }
 
 // Kayako config
@@ -235,12 +272,19 @@ fastify.all('/voice', async (request: FastifyRequest, reply: FastifyReply) => {
     reply.type('text/xml').send(twimlResponse);
 });
 
+// Add new interface for tracking speech segments
+let currentSpeechSegment: SpeechSegment | null = null;
+let isSpeaking = false;
+
 // WebSocket route for Twilio Media
 fastify.register(async (fastify: FastifyInstance) => {
     fastify.get('/media-stream', { websocket: true }, (connection: WebSocket, req: FastifyRequest) => {
         console.log('Client connected');
 
-        // Pull in caller info from Twilio
+        // Add call recorder
+        let callRecorder: CallRecorder | null = null;
+
+        // Caller info from Twilio
         const callerInfo = {
             phone: (req.body as any)?.Caller || null,
             city: (req.body as any)?.CallerCity || null,
@@ -259,6 +303,7 @@ fastify.register(async (fastify: FastifyInstance) => {
         // Initialize conversation state
         const conversationState: ConversationState = {
             transcript: [],
+            rawUserInput: [],
             userDetails: {
                 hasProvidedEmail: false,
                 phone: callerInfo.phone || undefined,
@@ -297,7 +342,7 @@ Remember: Always get the email first, then help with Kayako-related questions on
             },
         });
 
-        // Extract email from any text
+        // Helper: extract email from text
         function extractEmail(text: string): string | null {
             const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
             const match = text.match(emailRegex);
@@ -329,33 +374,74 @@ Remember: Always get the email first, then help with Kayako-related questions on
             console.log('Sent final silence buffer');
         }
 
-        // Add message to transcript
-        function addToTranscript(role: 'user' | 'assistant', content: string) {
-            console.log(`Adding ${role} message to transcript:`, content);
+        function getConfidenceLevel(score: number): ConfidenceLevel {
+            if (score > 0.9) return ConfidenceLevel.HIGH;
+            if (score > 0.6) return ConfidenceLevel.MEDIUM;
+            return ConfidenceLevel.LOW;
+        }
 
-            if (!content.trim()) {
-                console.log('Skipping empty message');
+        // Add message to transcript with enhanced validation
+        function addToTranscript(role: 'user' | 'assistant', content: string, confidence?: number) {
+            console.log('\n=== ADDING TO TRANSCRIPT ===');
+            console.log(`Role: ${role}`);
+            console.log('Content:', content);
+            console.log('Confidence:', confidence);
+
+            if (!content?.trim()) {
+                console.log('❌ Empty message, skipping');
                 return;
             }
 
-            conversationState.transcript.push({
+            const level = confidence ? getConfidenceLevel(confidence) : undefined;
+            console.log('Confidence Level:', level);
+
+            // Store raw user input with confidence level
+            if (role === 'user') {
+                conversationState.rawUserInput.push({
+                    content: content.trim(),
+                    timestamp: Date.now(),
+                    confidence,
+                    level,
+                    is_final: true
+                });
+                console.log('📝 Added to raw user input');
+            }
+
+            // Add to main transcript - now including all user messages
+            const lastMessage = conversationState.transcript[conversationState.transcript.length - 1];
+            if (lastMessage && lastMessage.role === role && lastMessage.content === content.trim()) {
+                console.log('❌ Duplicate message, skipping');
+                return;
+            }
+
+            const newEntry = {
                 role,
                 content: content.trim(),
-                timestamp: Date.now()
-            });
+                timestamp: Date.now(),
+                confidence,
+                level
+            };
+            conversationState.transcript.push(newEntry);
+            console.log('✅ Added to main transcript');
 
-            console.log('Current transcript length:', conversationState.transcript.length);
-            console.log('Latest transcript entry:', conversationState.transcript[conversationState.transcript.length - 1]);
+            // For low confidence, add a note
+            if (role === 'user' && level === ConfidenceLevel.LOW) {
+                console.log('⚠️ Low confidence speech - added with confidence indicator');
+            }
 
-            // If it's user speech, check for email
+            // Check for email in user messages
             if (role === 'user' && !conversationState.userDetails.hasProvidedEmail) {
                 const email = extractEmail(content);
                 if (email) {
-                    console.log('Found email in user message:', email);
+                    console.log('📧 Found email:', email);
                     conversationState.userDetails.email = email;
                     conversationState.userDetails.hasProvidedEmail = true;
                 }
             }
+
+            console.log('Current transcript length:', conversationState.transcript.length);
+            console.log('Current raw input length:', conversationState.rawUserInput.length);
+            console.log('=== END ADDING TO TRANSCRIPT ===\n');
         }
 
         // Check if AI response indicates no KB match
@@ -376,9 +462,9 @@ Remember: Always get the email first, then help with Kayako-related questions on
                 session: {
                     turn_detection: {
                         type: 'server_vad',
-                        threshold: 0.6,
-                        prefix_padding_ms: 300,
-                        silence_duration_ms: 800,
+                        threshold: 0.3,  // Lower threshold to capture more speech
+                        prefix_padding_ms: 500,  // Increased padding for better speech capture
+                        silence_duration_ms: 800,  // Longer silence duration for better segmentation
                         create_response: true,
                         interrupt_response: true
                     },
@@ -387,14 +473,14 @@ Remember: Always get the email first, then help with Kayako-related questions on
                     voice: VOICE,
                     instructions: ENHANCED_SYSTEM_MESSAGE,
                     modalities: ['text', 'audio'],
-                    temperature: 0.7,
+                    temperature: 0.7
                 },
             };
-            console.log('Initializing OpenAI session with enhanced system message');
+            console.log('Initializing OpenAI session with enhanced VAD settings');
             openAiWs.send(JSON.stringify(sessionUpdate));
         };
 
-        // Handle OpenAI WS
+        // OpenAI WebSocket
         openAiWs.on('open', () => {
             console.log('Connected to OpenAI Realtime API');
             setTimeout(initializeSession, 100);
@@ -404,34 +490,77 @@ Remember: Always get the email first, then help with Kayako-related questions on
             try {
                 const response = JSON.parse(rawData.toString());
 
-                console.log('OpenAI event:', response.type, response);
+                // Speech recognition events
+                if (response.type === 'speech.phrase') {
+                    console.log('\n=== SPEECH RECOGNITION ===');
+                    console.log('Raw response:', JSON.stringify(response, null, 2));
 
-                // If user speech recognized
-                if (response.type === 'speech.phrase' && response.text) {
-                    addToTranscript('user', response.text);
-                }
-
-                // If AI text
-                if (response.type === 'response.text' && response.text) {
-                    addToTranscript('assistant', response.text);
-
-                    if (checkForNoKBMatch(response.text)) {
-                        conversationState.kbMatchFound = false;
-                        conversationState.requiresHumanFollowup = true;
-                        console.log('No KB match found => needs human followup');
-                    } else {
-                        conversationState.kbMatchFound = true;
+                    if (!response.text) {
+                        console.log('❌ No text in speech recognition response');
+                        return;
                     }
+
+                    console.log('🗣️ User said:', response.text);
+                    console.log('Confidence:', response.confidence || 'N/A');
+                    console.log('Is final:', response.is_final || false);
+
+                    // Add to rawUserInput regardless of finality
+                    conversationState.rawUserInput.push({
+                        content: response.text,
+                        timestamp: Date.now(),
+                        confidence: response.confidence,
+                        is_final: response.is_final || false,
+                        duration: response.duration,
+                        start_time: response.start_time,
+                        end_time: response.end_time,
+                        level: response.confidence ?
+                            (response.confidence > 0.8 ? ConfidenceLevel.HIGH :
+                                response.confidence > 0.5 ? ConfidenceLevel.MEDIUM :
+                                    ConfidenceLevel.LOW) : undefined
+                    });
+
+                    // Only add final transcripts to avoid duplicates
+                    if (response.is_final) {
+                        addToTranscript('user', response.text, response.confidence);
+                        console.log('✅ Added final user transcript');
+                    }
+
+                    // Update current speech segment if active
+                    if (currentSpeechSegment) {
+                        currentSpeechSegment.transcription = response.text;
+                        currentSpeechSegment.confidence = response.confidence || 0;
+                        currentSpeechSegment.isFinal = response.is_final || false;
+                    } else {
+                        console.log('⚠️ No active speech segment');
+                    }
+
+                    console.log('=== END SPEECH RECOGNITION ===\n');
                 }
 
-                // [FIXED HERE] If final transcript is from the AI's audio output
-                if (response.type === 'response.audio_transcript.done' && response.transcript) {
-                    console.log('Got final assistant transcript from audio:', response.transcript);
-                    addToTranscript('assistant', response.transcript);
+                // AI response events
+                if (response.type === 'response.text' || response.type === 'response.audio_transcript.done') {
+                    console.log('\n=== AI RESPONSE ===');
+                    const text = response.text || response.transcript;
+                    if (text) {
+                        console.log('💬 AI:', text);
+
+                        // Only add non-duplicate responses
+                        const lastMessage = conversationState.transcript[conversationState.transcript.length - 1];
+                        if (!lastMessage || lastMessage.role !== 'assistant' || lastMessage.content !== text) {
+                            addToTranscript('assistant', text, response.confidence);
+                        } else {
+                            console.log('⚠️ Duplicate AI response, skipping');
+                        }
+                    }
+                    console.log('=== END AI RESPONSE ===\n');
                 }
 
-                // Audio deltas => forward to Twilio
+                // Record AI audio
                 if (response.type === 'response.audio.delta' && response.delta) {
+                    if (callRecorder) {
+                        callRecorder.addAIAudio(response.delta);
+                    }
+
                     const audioDelta = {
                         event: 'media',
                         streamSid: streamSid,
@@ -442,30 +571,21 @@ Remember: Always get the email first, then help with Kayako-related questions on
                     if (!responseStartTimestampTwilio) {
                         responseStartTimestampTwilio = latestMediaTimestamp;
                     }
-
                     if (response.item_id) {
                         lastAssistantItem = response.item_id;
                     }
                     sendMark(connection, streamSid!);
                 }
 
-                if (response.type === 'response.done') {
-                    console.log('AI response fully done => sending final silence');
-                    isResponseFullyDone = true;
-                    if (streamSid) {
-                        sendSilence();
-                        setTimeout(() => {
-                            console.log('Final silence played => response complete');
-                        }, 1000);
-                    }
-                }
-
+                // Speech started event
                 if (response.type === 'input_audio_buffer.speech_started') {
+                    console.log('\n🎤 User started speaking');
                     handleSpeechStartedEvent();
                 }
 
             } catch (err) {
-                console.error('Error handling OpenAI message:', err, 'Raw:', rawData);
+                console.error('❌ Error handling OpenAI message:', err);
+                console.error('Raw data:', rawData.toString());
             }
         });
 
@@ -473,57 +593,77 @@ Remember: Always get the email first, then help with Kayako-related questions on
         connection.on('message', (rawMsg: WebSocket.Data) => {
             try {
                 const data: TwilioMediaEvent = JSON.parse(rawMsg.toString());
-                switch (data.event) {
-                    case 'media':
-                        if (data.media) {
-                            latestMediaTimestamp = data.media.timestamp;
-                            if (SHOW_TIMING_MATH) {
-                                console.log(`Received Twilio media timestamp: ${latestMediaTimestamp}ms`);
-                            }
-                            if (openAiWs.readyState === WebSocket.OPEN) {
-                                const audioAppend = {
-                                    type: 'input_audio_buffer.append',
-                                    audio: data.media.payload,
-                                };
-                                openAiWs.send(JSON.stringify(audioAppend));
-                            }
-                        }
-                        break;
-                    case 'start':
-                        if (data.start) {
-                            streamSid = data.start.streamSid;
-                            console.log('Incoming stream started:', streamSid);
-                            responseStartTimestampTwilio = null;
-                            latestMediaTimestamp = 0;
-                        }
-                        break;
-                    case 'mark':
-                        if (markQueue.length > 0) {
-                            markQueue.shift();
-                        }
-                        break;
-                    default:
-                        console.log('Received non-media event:', data.event);
-                        break;
+
+                // Initialize recorder on call start
+                if (data.event === 'start') {
+                    console.log('\n=== CALL STARTED ===');
+                    console.log('Stream SID:', data.start?.streamSid);
+                    streamSid = data.start?.streamSid || null;
+                    if (streamSid) {
+                        callRecorder = createCallRecorder(streamSid);
+                    }
+                    console.log('=== END CALL STARTED ===\n');
                 }
+
+                // Record user audio
+                if (data.event === 'media' && data.media) {
+                    latestMediaTimestamp = data.media.timestamp;
+
+                    // Add to recorder
+                    if (callRecorder) {
+                        callRecorder.addUserAudio(data.media.payload);
+                    }
+
+                    // Send to OpenAI
+                    if (openAiWs.readyState === WebSocket.OPEN) {
+                        openAiWs.send(JSON.stringify({
+                            type: 'input_audio_buffer.append',
+                            audio: data.media.payload,
+                        }));
+                    }
+
+                    // Check for speech end (silence detection)
+                    if (isSpeaking && currentSpeechSegment && currentSpeechSegment.audioPayloads.length > 50) {
+                        const lastPayloads = currentSpeechSegment.audioPayloads.slice(-20);
+                        const isAllSilence = lastPayloads.every(payload => {
+                            const buffer = Buffer.from(payload, 'base64');
+                            return buffer.every(byte => byte === 0xFF);
+                        });
+
+                        if (isAllSilence) {
+                            handleSpeechEndedEvent();
+                        }
+                    }
+                }
+
             } catch (err) {
-                console.error('Error parsing Twilio message:', err, 'Message:', rawMsg);
+                console.error('❌ Error handling Twilio message:', err);
             }
         });
 
-        // Connection closed
+        // When Twilio connection closes
         connection.on('close', async () => {
             console.log('Call ended, conversation state:', JSON.stringify(conversationState, null, 2));
 
-            // If we have a transcript
+            let mp3Path: string | undefined;
+
+            // Finish recording if we have one
+            if (callRecorder) {
+                try {
+                    mp3Path = await callRecorder.finishRecording();
+                    console.log('Recorded call saved to:', mp3Path);
+                } catch (error) {
+                    console.error('Failed to save call recording:', error);
+                }
+            }
+
             if (conversationState.transcript.length > 0) {
                 console.log(`Creating Kayako ticket with ${conversationState.transcript.length} messages`);
                 try {
-                    await createKayakoTicket(conversationState);
+                    await createKayakoTicket(conversationState, mp3Path);
                     console.log('Successfully created Kayako ticket');
                 } catch (error) {
                     console.error('Failed to create Kayako ticket:', error);
-                    // For debugging
                     console.error('Conversation state at time of failure:', JSON.stringify(conversationState, null, 2));
                 }
             } else {
@@ -555,8 +695,7 @@ Remember: Always get the email first, then help with Kayako-related questions on
             }
         });
 
-        // Helper to send "mark" events
-        const sendMark = (ws: WebSocket, sSid: string): void => {
+        function sendMark(ws: WebSocket, sSid: string): void {
             if (sSid) {
                 const markEvent = {
                     event: 'mark',
@@ -566,12 +705,25 @@ Remember: Always get the email first, then help with Kayako-related questions on
                 ws.send(JSON.stringify(markEvent));
                 markQueue.push('responsePart');
             }
-        };
+        }
 
-        // Barge-in
-        const handleSpeechStartedEvent = (): void => {
+        function handleSpeechStartedEvent(): void {
             if (Date.now() - lastSpeechStartTime < 500) return;
             lastSpeechStartTime = Date.now();
+            isSpeaking = true;
+
+            // Start new speech segment
+            currentSpeechSegment = {
+                id: Date.now().toString(),
+                startTime: Date.now(),
+                endTime: null,
+                transcription: '',
+                confidence: 0,
+                isFinal: false,
+                audioPayloads: []
+            };
+
+            console.log('🎤 Started new speech segment at:', new Date(lastSpeechStartTime).toISOString());
 
             if (lastAssistantItem) {
                 openAiWs.send(JSON.stringify({
@@ -590,7 +742,60 @@ Remember: Always get the email first, then help with Kayako-related questions on
                     }));
                 }
             }
-        };
+        }
+
+        // Add speech end detection
+        function handleSpeechEndedEvent(): void {
+            if (!isSpeaking || !currentSpeechSegment) {
+                console.log('❌ Cannot end speech segment: no active segment');
+                return;
+            }
+
+            isSpeaking = false;
+            const endTime = Date.now();
+            const duration = (endTime - currentSpeechSegment.startTime) / 1000;
+
+            // Update the speech segment
+            currentSpeechSegment.endTime = endTime;
+            currentSpeechSegment.isFinal = true;
+
+            // Add detailed speech segment info to raw input
+            const segmentInfo = {
+                content: `[Speech segment - Duration: ${duration.toFixed(1)}s]`,
+                timestamp: currentSpeechSegment.startTime,
+                confidence: currentSpeechSegment.confidence,
+                duration: duration,
+                start_time: new Date(currentSpeechSegment.startTime).toISOString(),
+                end_time: new Date(endTime).toISOString(),
+                is_final: true,
+                level: getConfidenceLevel(currentSpeechSegment.confidence)
+            };
+
+            // Only add to rawUserInput if we don't have a transcription yet
+            if (!currentSpeechSegment) return;
+            const segment = currentSpeechSegment as SpeechSegment;
+            const hasTranscription = conversationState.rawUserInput.some(
+                entry => entry.timestamp >= segment.startTime
+                    && entry.timestamp <= endTime
+                    && typeof entry.content === 'string'
+                    && !entry.content.startsWith('[Speech segment')
+            );
+
+            if (!hasTranscription) {
+                conversationState.rawUserInput.push(segmentInfo);
+                console.log('📝 Added speech segment info to raw input (no transcription available)');
+            }
+
+            console.log('🛑 Speech segment ended:', {
+                id: currentSpeechSegment.id,
+                duration: duration.toFixed(1) + 's',
+                confidence: currentSpeechSegment.confidence,
+                transcription: currentSpeechSegment.transcription || 'No transcription',
+                isFinal: currentSpeechSegment.isFinal
+            });
+
+            currentSpeechSegment = null;
+        }
     });
 });
 
@@ -614,9 +819,10 @@ const start = async (): Promise<void> => {
 start();
 
 /**
- * We changed the email extraction so it can pick up from
- * the entire transcript, not just user messages.
+ * Below are your existing helper functions,
+ * unchanged except for referencing them in the final code.
  */
+
 function extractEmailFromMessages(messages: string[]): string | null {
     for (const msg of messages) {
         const match = msg.match(/[\w.-]+@[\w.-]+\.\w+/);
@@ -627,17 +833,12 @@ function extractEmailFromMessages(messages: string[]): string | null {
     return null;
 }
 
-/**
- * Generate a summarized subject, summary, and detect an email from ANY transcript line
- * (not just user lines).
- */
 function generateTicketSummary(conversation: ConversationState): {
     subject: string;
     summary: string;
     email: string | null;
     requiresFollowup: boolean;
 } {
-    // Gather ALL messages from the entire transcript
     const allMessages = conversation.transcript.map(e => e.content);
     const userMessages = conversation.transcript
         .filter(e => e.role === 'user')
@@ -646,26 +847,22 @@ function generateTicketSummary(conversation: ConversationState): {
         .filter(e => e.role === 'assistant')
         .map(e => e.content);
 
-    // Extract email from the entire transcript or user details
     const email = conversation.userDetails.email || extractEmailFromMessages(allMessages);
 
-    // Check if followup is needed
     const requiresFollowup = aiResponses.some(resp =>
         resp.toLowerCase().includes('specialist') ||
         resp.toLowerCase().includes('follow up') ||
-        resp.toLowerCase().includes('don\'t have specific information')
+        resp.toLowerCase().includes("don't have specific information")
     );
 
-    // Determine subject from the first meaningful user message
     let subject = 'New Support Call';
     if (userMessages.length > 0) {
-        const firstMeaningful = userMessages.find(msg => !msg.match(/^[\w.-]+@[\w.-]+\.\w+$/));
+        const firstMeaningful = userMessages.find(msg => !msg.match(/^[\\w.-]+@[\\w.-]+\\.\w+$/));
         if (firstMeaningful) {
             subject = firstMeaningful.substring(0, 100);
         }
     }
 
-    // Generate a concise summary of the conversation
     const summary = `The customer inquired about ${subject.toLowerCase()}. ${aiResponses.length > 0
         ? `The AI provided assistance with ${generateKeyPoints(conversation.transcript)}. `
         : ''
@@ -705,12 +902,35 @@ function generateKeyPoints(transcript: Array<{ role: string; content: string }>)
     return result || 'General Inquiry';
 }
 
-// Create Kayako ticket
-async function createKayakoTicket(conversation: ConversationState): Promise<void> {
+/**
+ * Transcribe an audio file using OpenAI's Whisper API
+ */
+async function transcribeAudioFile(audioPath: string): Promise<string> {
+    console.log('Transcribing audio file:', audioPath);
+
+    try {
+        const openai = new OpenAI();
+        const transcription = await openai.audio.transcriptions.create({
+            file: fs.createReadStream(audioPath),
+            model: "whisper-1",
+            language: "en",
+            response_format: "text"
+        });
+
+        console.log('Successfully transcribed audio file');
+        return transcription;
+    } catch (error) {
+        console.error('Error transcribing audio:', error);
+        throw error;
+    }
+}
+
+// Modify createKayakoTicket function
+async function createKayakoTicket(conversation: ConversationState, mp3Path?: string): Promise<void> {
     console.log('Starting Kayako ticket creation...');
 
-    if (!conversation.transcript || conversation.transcript.length === 0) {
-        throw new Error('Cannot create ticket: No transcript');
+    if (!conversation.transcript && !conversation.rawUserInput) {
+        throw new Error('Cannot create ticket: No transcript or raw input');
     }
 
     try {
@@ -718,7 +938,102 @@ async function createKayakoTicket(conversation: ConversationState): Promise<void
         const ticketInfo = generateTicketSummary(conversation);
         console.log('Generated ticket info:', ticketInfo);
 
-        // If we extracted an email from the entire transcript
+        // Get audio transcript if MP3 file exists
+        let audioTranscript: string | undefined;
+        if (mp3Path && fs.existsSync(mp3Path)) {
+            try {
+                audioTranscript = await transcribeAudioFile(mp3Path);
+                console.log('Generated audio transcript:', audioTranscript);
+            } catch (error) {
+                console.error('Failed to transcribe audio file:', error);
+            }
+        }
+
+        // Upload MP3 file if available
+        let attachmentId = '';
+        if (mp3Path && fs.existsSync(mp3Path)) {
+            console.log('Uploading call recording...');
+            const form = new FormData();
+            const fileName = path.basename(mp3Path);
+
+            form.append('name', fileName);
+            form.append('content', `Call Recording - ${fileName}`);
+            form.append('file', fs.createReadStream(mp3Path), {
+                filename: fileName,
+                contentType: 'audio/mp3'
+            });
+
+            // Log the form contents
+            console.log('Form fields:', {
+                name: fileName,
+                content: `Call Recording - ${fileName}`,
+                file: `<Stream of ${fileName}>`
+            });
+
+            // Create promise for the request
+            const uploadPromise = new Promise((resolve, reject) => {
+                const url = new URL(`${KAYAKO_CONFIG.baseUrl}/files`);
+                const auth = Buffer.from(`${KAYAKO_CONFIG.username}:${KAYAKO_CONFIG.password}`).toString('base64');
+
+                const options = {
+                    method: 'POST',
+                    host: url.hostname,
+                    path: `${url.pathname}${url.search}`,
+                    headers: {
+                        Authorization: `Basic ${auth}`,
+                        ...form.getHeaders()
+                    }
+                };
+
+                console.log('Making file upload request to:', `${url.protocol}//${url.host}${options.path}`);
+
+                const req = (url.protocol === 'https:' ? https : http).request(options, (res) => {
+                    let data = '';
+                    res.on('data', chunk => {
+                        data += chunk;
+                        console.log('Received chunk:', chunk.toString());
+                    });
+                    res.on('end', () => {
+                        console.log('Full response:', data);
+                        console.log('Response status:', res.statusCode);
+                        console.log('Response headers:', res.headers);
+
+                        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+                            try {
+                                const response = JSON.parse(data);
+                                if (!response.id) {
+                                    reject(new Error(`Upload succeeded but no attachment ID in response: ${data}`));
+                                    return;
+                                }
+                                resolve(response);
+                            } catch (e) {
+                                reject(new Error(`Failed to parse response: ${data}`));
+                            }
+                        } else {
+                            reject(new Error(`Upload failed with status ${res.statusCode}: ${data}`));
+                        }
+                    });
+                });
+
+                req.on('error', (error) => {
+                    console.error('Request error:', error);
+                    reject(error);
+                });
+
+                // Log what we're sending
+                console.log('Sending form data with fields:', form.getBoundary());
+                form.pipe(req);
+            });
+
+            try {
+                const attachmentData = await uploadPromise as KayakoAttachmentResponse;
+                attachmentId = attachmentData.id;
+                console.log('Successfully uploaded recording, attachment ID:', attachmentId);
+            } catch (error) {
+                console.error('Failed to upload recording:', error);
+            }
+        }
+
         if (ticketInfo.email && !conversation.userDetails.email) {
             conversation.userDetails.email = ticketInfo.email;
             conversation.userDetails.hasProvidedEmail = true;
@@ -727,15 +1042,37 @@ async function createKayakoTicket(conversation: ConversationState): Promise<void
             conversation.requiresHumanFollowup = true;
         }
 
-        // Format the transcript in chronological order
-        const transcriptText = conversation.transcript
+        // Combine transcript and raw input chronologically
+        const allInteractions = [
+            ...conversation.transcript.map(entry => ({
+                type: 'transcript',
+                role: entry.role,
+                content: entry.content,
+                timestamp: entry.timestamp
+            })),
+            ...conversation.rawUserInput.map(entry => ({
+                type: 'raw',
+                role: 'user',
+                content: entry.content,
+                timestamp: entry.timestamp,
+                confidence: entry.confidence
+            }))
+        ].sort((a, b) => a.timestamp - b.timestamp);
+
+        // Format transcript with proper spacing and role labels
+        const transcriptText = allInteractions
             .map(entry => {
-                const role = entry.role === 'assistant' ? 'Agent' : 'User';
-                return `${role}: ${entry.content}`;
+                const timestamp = new Date(entry.timestamp).toISOString();
+                if (entry.type === 'transcript') {
+                    const role = entry.role === 'assistant' ? 'Agent' : 'Customer';
+                    return `${role} [${timestamp}]: ${entry.content}`;
+                } else {
+                    // Raw input entries
+                    return `Customer (Raw) [${timestamp}] (Confidence: ${(entry as any).confidence?.toFixed(2) || 'N/A'}): ${entry.content}`;
+                }
             })
             .join('\n\n');
 
-        // Create the ticket content with proper HTML formatting
         const ticketContent = `
 <div style="font-family: Arial, sans-serif; line-height: 1.6;">
     <div style="margin-bottom: 20px;">
@@ -754,10 +1091,29 @@ async function createKayakoTicket(conversation: ConversationState): Promise<void
     </div>
 
     <div style="margin-bottom: 20px;">
-        <strong>CALL TRANSCRIPT</strong><br>
-        <div style="white-space: pre-wrap; font-family: monospace;">
+        <strong>REAL-TIME TRANSCRIPT</strong><br>
+        <pre style="white-space: pre-wrap; font-family: monospace; background: #f5f5f5; padding: 15px; border-radius: 4px; margin: 10px 0;">
 ${transcriptText}
-        </div>
+        </pre>
+    </div>
+
+    ${audioTranscript ? `
+    <div style="margin-bottom: 20px;">
+        <strong>AUDIO TRANSCRIPT</strong><br>
+        <pre style="white-space: pre-wrap; font-family: monospace; background: #f5f5f5; padding: 15px; border-radius: 4px; margin: 10px 0;">
+${audioTranscript}
+        </pre>
+    </div>
+    ` : ''}
+
+    <div style="margin-bottom: 20px;">
+        <strong>SPEECH SEGMENTS SUMMARY</strong><br>
+        <pre style="white-space: pre-wrap; font-family: monospace; background: #f7f7f7; padding: 15px; border-radius: 4px; margin: 10px 0;">
+Total Speech Segments: ${conversation.rawUserInput.length}
+${conversation.rawUserInput.map((entry, index) =>
+            `Segment ${index + 1}: ${entry.content} (Confidence: ${entry.confidence?.toFixed(2) || 'N/A'})`
+        ).join('\n')}
+        </pre>
     </div>
 </div>`;
 
@@ -766,7 +1122,7 @@ ${transcriptText}
                 product: "80"
             },
             status_id: "1",
-            attachment_file_ids: "",
+            attachment_file_ids: attachmentId ? [attachmentId] : [],
             tags: "gauntlet-ai",
             type_id: 7,
             channel: "MAIL",
@@ -788,8 +1144,8 @@ ${transcriptText}
         const response = await fetch(`${KAYAKO_CONFIG.baseUrl}/cases`, {
             method: 'POST',
             headers: {
-                'Content-Type': 'application/json',
-                'Authorization': 'Basic ' + Buffer.from(`${KAYAKO_CONFIG.username}:${KAYAKO_CONFIG.password}`).toString('base64')
+                'Content-Type': 'application/json; charset=UTF-8',
+                Authorization: 'Basic ' + Buffer.from(`${KAYAKO_CONFIG.username}:${KAYAKO_CONFIG.password}`).toString('base64')
             },
             body: JSON.stringify(ticket)
         });
