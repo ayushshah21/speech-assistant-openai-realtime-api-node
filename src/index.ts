@@ -925,6 +925,66 @@ async function transcribeAudioFile(audioPath: string): Promise<string> {
     }
 }
 
+/**
+ * Parse the audio transcript into structured conversation using OpenAI
+ */
+async function parseTranscriptWithAI(transcript: string): Promise<Array<{ role: 'agent' | 'customer', text: string }>> {
+    const openai = new OpenAI();
+
+    const response = await openai.chat.completions.create({
+        model: "gpt-4-turbo-preview",
+        messages: [{
+            role: "system",
+            content: `You are a conversation parser for customer support calls. Your task is to break down a transcript into 
+                     a sequence of alternating messages between agent and customer. 
+
+                     Key patterns to recognize:
+                     - Agent typically starts with phrases like "Before I assist you", "Thank you", "I've noted", "How can I help"
+                     - Customer responses are usually informal and include questions or provide information
+                     - The conversation follows a typical pattern: agent asks for info -> customer provides -> agent confirms
+                     
+                     Format your response as a JSON object with a "messages" array where each element has:
+                     - role: either "agent" or "customer"
+                     - text: the exact text spoken
+
+                     Maintain the exact sequence and content of the conversation.`
+        }, {
+            role: "user",
+            content: `Parse this customer support transcript into a structured conversation, carefully separating agent and customer messages: ${transcript}`
+        }],
+        response_format: { type: "json_object" },
+        temperature: 0.1
+    });
+
+    try {
+        const content = response.choices[0].message.content || '{"messages": []}';
+        const result = JSON.parse(content);
+        if (!result.messages || !Array.isArray(result.messages) || result.messages.length === 0) {
+            console.warn('Failed to parse conversation structure, using fallback parsing');
+            // Attempt basic fallback parsing with proper typing
+            const messages: Array<{ role: 'agent' | 'customer', text: string }> = transcript
+                .split(/(?=[A-Z][a-z]+:)/)
+                .filter(Boolean)
+                .map(segment => {
+                    const role: 'agent' | 'customer' = (
+                        segment.toLowerCase().includes('before i assist') ||
+                        segment.toLowerCase().includes('thank you') ||
+                        segment.toLowerCase().includes('how can i help')
+                    ) ? 'agent' : 'customer';
+                    return { role, text: segment.trim() };
+                });
+            return messages;
+        }
+        return result.messages;
+    } catch (error) {
+        console.error('Failed to parse AI response:', error);
+        return [{
+            role: 'customer' as const,
+            text: transcript
+        }];
+    }
+}
+
 // Modify createKayakoTicket function
 async function createKayakoTicket(conversation: ConversationState, mp3Path?: string): Promise<void> {
     console.log('Starting Kayako ticket creation...');
@@ -938,14 +998,20 @@ async function createKayakoTicket(conversation: ConversationState, mp3Path?: str
         const ticketInfo = generateTicketSummary(conversation);
         console.log('Generated ticket info:', ticketInfo);
 
-        // Get audio transcript if MP3 file exists
+        // Get audio transcript and parse it with AI
         let audioTranscript: string | undefined;
+        let parsedTranscript: Array<{ role: 'agent' | 'customer', text: string }> = [];
+
         if (mp3Path && fs.existsSync(mp3Path)) {
             try {
                 audioTranscript = await transcribeAudioFile(mp3Path);
                 console.log('Generated audio transcript:', audioTranscript);
+
+                // Parse transcript with AI
+                parsedTranscript = await parseTranscriptWithAI(audioTranscript);
+                console.log('Parsed transcript:', parsedTranscript);
             } catch (error) {
-                console.error('Failed to transcribe audio file:', error);
+                console.error('Failed to transcribe or parse audio file:', error);
             }
         }
 
@@ -1090,31 +1156,23 @@ async function createKayakoTicket(conversation: ConversationState, mp3Path?: str
         ${ticketInfo.requiresFollowup ? 'HIGH' : 'LOW'}
     </div>
 
+    ${parsedTranscript.length > 0 ? `
     <div style="margin-bottom: 20px;">
-        <strong>REAL-TIME TRANSCRIPT</strong><br>
-        <pre style="white-space: pre-wrap; font-family: monospace; background: #f5f5f5; padding: 15px; border-radius: 4px; margin: 10px 0;">
-${transcriptText}
-        </pre>
-    </div>
-
-    ${audioTranscript ? `
-    <div style="margin-bottom: 20px;">
-        <strong>AUDIO TRANSCRIPT</strong><br>
-        <pre style="white-space: pre-wrap; font-family: monospace; background: #f5f5f5; padding: 15px; border-radius: 4px; margin: 10px 0;">
-${audioTranscript}
-        </pre>
+        <strong>CALL TRANSCRIPT</strong><br>
+        <div style="background: #f5f5f5; padding: 15px; border-radius: 4px; margin: 10px 0;">
+            ${parsedTranscript.map(message => `
+                <div style="margin-bottom: 10px;">
+                    <span style="color: ${message.role === 'agent' ? '#2c5282' : '#805ad5'}; font-weight: bold;">
+                        ${message.role === 'agent' ? 'Agent' : 'Customer'}: 
+                    </span>
+                    <span style="color: ${message.role === 'agent' ? '#2c5282' : '#805ad5'};">
+                        ${message.text}
+                    </span>
+                </div>
+            `).join('\n')}
+        </div>
     </div>
     ` : ''}
-
-    <div style="margin-bottom: 20px;">
-        <strong>SPEECH SEGMENTS SUMMARY</strong><br>
-        <pre style="white-space: pre-wrap; font-family: monospace; background: #f7f7f7; padding: 15px; border-radius: 4px; margin: 10px 0;">
-Total Speech Segments: ${conversation.rawUserInput.length}
-${conversation.rawUserInput.map((entry, index) =>
-            `Segment ${index + 1}: ${entry.content} (Confidence: ${entry.confidence?.toFixed(2) || 'N/A'})`
-        ).join('\n')}
-        </pre>
-    </div>
 </div>`;
 
         const ticket: KayakoTicket = {
