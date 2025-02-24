@@ -254,6 +254,17 @@ const KAYAKO_CONFIG = {
     defaultTeam: '1'
 };
 
+// Helper function to check if AI response indicates no KB match
+function checkForNoKBMatch(response: string): boolean {
+    const noMatchPhrases = [
+        "I don't have specific information",
+        "I'll have a support specialist follow up",
+        "would you like me to connect you with a support specialist",
+        "I don't have that information in my knowledge base"
+    ];
+    return noMatchPhrases.some(phrase => response.toLowerCase().includes(phrase.toLowerCase()));
+}
+
 // Root route
 fastify.get('/', async (_request: FastifyRequest, reply: FastifyReply) => {
     reply.send({ message: 'Twilio Media Stream Server is running!' });
@@ -442,17 +453,6 @@ Remember: Always get the email first, then help with Kayako-related questions on
             console.log('Current transcript length:', conversationState.transcript.length);
             console.log('Current raw input length:', conversationState.rawUserInput.length);
             console.log('=== END ADDING TO TRANSCRIPT ===\n');
-        }
-
-        // Check if AI response indicates no KB match
-        function checkForNoKBMatch(response: string): boolean {
-            const noMatchPhrases = [
-                "I don't have specific information",
-                "I'll have a support specialist follow up",
-                "would you like me to connect you with a support specialist",
-                "I don't have that information in my knowledge base"
-            ];
-            return noMatchPhrases.some(phrase => response.toLowerCase().includes(phrase.toLowerCase()));
         }
 
         // Initialize Realtime session
@@ -825,7 +825,7 @@ start();
 
 function extractEmailFromMessages(messages: string[]): string | null {
     for (const msg of messages) {
-        const match = msg.match(/[\w.-]+@[\w.-]+\.\w+/);
+        const match = msg.match(/[\w.-]+@[\w.-]+\.\w+$/);
         if (match) {
             return match[0];
         }
@@ -833,50 +833,196 @@ function extractEmailFromMessages(messages: string[]): string | null {
     return null;
 }
 
-function generateTicketSummary(conversation: ConversationState): {
-    subject: string;
-    summary: string;
-    email: string | null;
-    requiresFollowup: boolean;
-} {
-    const allMessages = conversation.transcript.map(e => e.content);
-    const userMessages = conversation.transcript
-        .filter(e => e.role === 'user')
-        .map(e => e.content);
-    const aiResponses = conversation.transcript
-        .filter(e => e.role === 'assistant')
-        .map(e => e.content);
+/**
+ * Extract questions from user messages in the transcript
+ */
+function extractUserQuestions(transcript: Array<{ role: string; content: string; timestamp?: number }>): string[] {
+    const questions: string[] = [];
 
-    const email = conversation.userDetails.email || extractEmailFromMessages(allMessages);
+    // Process each user message
+    transcript.filter(entry => entry.role === 'user').forEach(entry => {
+        const content = entry.content;
 
-    const requiresFollowup = aiResponses.some(resp =>
-        resp.toLowerCase().includes('specialist') ||
-        resp.toLowerCase().includes('follow up') ||
-        resp.toLowerCase().includes("don't have specific information")
-    );
+        // Split content into sentences
+        const sentences = content.split(/[.!?]+/).filter(s => s.trim().length > 0);
 
-    let subject = 'New Support Call';
-    if (userMessages.length > 0) {
-        const firstMeaningful = userMessages.find(msg => !msg.match(/^[\\w.-]+@[\\w.-]+\\.\w+$/));
-        if (firstMeaningful) {
-            subject = firstMeaningful.substring(0, 100);
-        }
+        // Check each sentence for question patterns
+        sentences.forEach(sentence => {
+            const trimmed = sentence.trim();
+
+            // Check for question marks
+            if (trimmed.includes('?')) {
+                questions.push(trimmed);
+                return;
+            }
+
+            // Check for question words at the beginning
+            const questionWords = ['how', 'what', 'why', 'where', 'when', 'who', 'can', 'could', 'would', 'is', 'are', 'do', 'does'];
+            const firstWord = trimmed.split(' ')[0].toLowerCase();
+
+            if (questionWords.includes(firstWord)) {
+                questions.push(trimmed);
+                return;
+            }
+
+            // Check for phrases indicating a question
+            const questionPhrases = ['tell me about', 'i need to know', 'i want to know', 'explain', 'help me with'];
+            if (questionPhrases.some(phrase => trimmed.toLowerCase().includes(phrase))) {
+                questions.push(trimmed);
+            }
+        });
+    });
+
+    return questions;
+}
+
+/**
+ * Analyze the conversation to determine which questions were resolved
+ */
+async function analyzeConversationResolution(
+    transcript: Array<{ role: string; content: string; timestamp?: number }>,
+    questions: string[]
+): Promise<{
+    resolvedQuestions: string[];
+    unresolvedQuestions: string[];
+    hasPositiveAcknowledgment: boolean;
+    hasNegativeResponse: boolean;
+    topicKeywords: string[];
+}> {
+    // If there are no questions or transcript is too short, return default values
+    if (questions.length === 0 || transcript.length < 2) {
+        return {
+            resolvedQuestions: [],
+            unresolvedQuestions: [],
+            hasPositiveAcknowledgment: false,
+            hasNegativeResponse: false,
+            topicKeywords: []
+        };
     }
 
-    const summary = `The customer inquired about ${subject.toLowerCase()}. ${aiResponses.length > 0
-        ? `The AI provided assistance with ${generateKeyPoints(conversation.transcript)}. `
-        : ''
-        }${requiresFollowup
-            ? 'The conversation requires human follow-up as the AI could not fully address the inquiry.'
-            : 'The AI successfully resolved the customer\'s inquiry.'
-        }`;
+    try {
+        // Format the transcript for the LLM
+        const formattedTranscript = transcript.map(entry =>
+            `${entry.role === 'user' ? 'Customer' : 'Agent'}: ${entry.content}`
+        ).join('\n');
 
-    return {
-        subject,
-        summary,
-        email,
-        requiresFollowup
-    };
+        // Format the questions for the LLM
+        const formattedQuestions = questions.map((q, i) => `Question ${i + 1}: ${q}`).join('\n');
+
+        // Use OpenAI to analyze the conversation
+        const openai = new OpenAI();
+        const response = await openai.chat.completions.create({
+            model: "gpt-4-turbo-preview",
+            messages: [
+                {
+                    role: "system",
+                    content: `You are an expert conversation analyst for customer support interactions. 
+                    Your task is to analyze a conversation transcript between a customer and an AI support agent.
+                    Determine which questions were resolved satisfactorily and which ones remain unresolved.
+                    Also identify if the customer expressed positive acknowledgment or negative sentiment.
+                    Extract key topic keywords related to Kayako products and services.`
+                },
+                {
+                    role: "user",
+                    content: `Please analyze this customer support conversation:
+                    
+                    TRANSCRIPT:
+                    ${formattedTranscript}
+                    
+                    CUSTOMER QUESTIONS:
+                    ${formattedQuestions}
+                    
+                    Provide your analysis in JSON format with these fields:
+                    - resolvedQuestions: array of questions that were satisfactorily answered
+                    - unresolvedQuestions: array of questions that were not fully addressed
+                    - hasPositiveAcknowledgment: boolean indicating if customer expressed satisfaction
+                    - hasNegativeResponse: boolean indicating if customer expressed dissatisfaction
+                    - topicKeywords: array of keywords related to Kayako products/services mentioned`
+                }
+            ],
+            response_format: { type: "json_object" },
+            temperature: 0.1
+        });
+
+        // Parse the response
+        const content = response.choices[0].message.content || '{}';
+        const result = JSON.parse(content);
+
+        console.log('LLM conversation analysis result:', result);
+
+        return {
+            resolvedQuestions: result.resolvedQuestions || [],
+            unresolvedQuestions: result.unresolvedQuestions || [],
+            hasPositiveAcknowledgment: result.hasPositiveAcknowledgment || false,
+            hasNegativeResponse: result.hasNegativeResponse || false,
+            topicKeywords: result.topicKeywords || []
+        };
+    } catch (error) {
+        console.error('Error analyzing conversation with LLM:', error);
+
+        // Fallback to basic keyword matching if LLM analysis fails
+        console.log('Falling back to basic keyword matching for conversation analysis');
+        const resolvedQuestions: string[] = [];
+        const unresolvedQuestions: string[] = questions.slice();
+        let hasPositiveAcknowledgment = false;
+        let hasNegativeResponse = false;
+        const topicKeywords: string[] = [];
+
+        // Extract keywords from the conversation
+        transcript.forEach(entry => {
+            const text = entry.content.toLowerCase();
+
+            // Check for keywords related to Kayako topics
+            const kayakoKeywords = [
+                'sso', 'single sign-on', 'login', 'password', 'reset', 'account',
+                'admin', 'administrator', 'user', 'profile', 'email', 'update',
+                'ticket', 'support', 'help', 'issue', 'problem', 'error'
+            ];
+
+            kayakoKeywords.forEach(keyword => {
+                if (text.includes(keyword) && !topicKeywords.includes(keyword)) {
+                    topicKeywords.push(keyword);
+                }
+            });
+        });
+
+        // Check for positive acknowledgment in the last few user messages
+        const lastUserMessages = transcript
+            .filter(entry => entry.role === 'user')
+            .slice(-3)
+            .map(entry => entry.content.toLowerCase());
+
+        hasPositiveAcknowledgment = lastUserMessages.some(msg =>
+            msg.includes('thank') ||
+            msg.includes('great') ||
+            msg.includes('perfect') ||
+            msg.includes('helpful') ||
+            msg.includes('appreciate') ||
+            msg.includes('got it') ||
+            msg.includes('understand') ||
+            msg.includes('clear')
+        );
+
+        hasNegativeResponse = lastUserMessages.some(msg =>
+            msg.includes('not working') ||
+            msg.includes('doesn\'t work') ||
+            msg.includes('didn\'t work') ||
+            msg.includes('doesn\'t help') ||
+            msg.includes('didn\'t help') ||
+            msg.includes('still have') ||
+            msg.includes('still not') ||
+            msg.includes('not what i') ||
+            msg.includes('not correct')
+        );
+
+        return {
+            resolvedQuestions,
+            unresolvedQuestions,
+            hasPositiveAcknowledgment,
+            hasNegativeResponse,
+            topicKeywords
+        };
+    }
 }
 
 function generateKeyPoints(transcript: Array<{ role: string; content: string }>): string {
@@ -985,7 +1131,7 @@ async function parseTranscriptWithAI(transcript: string): Promise<Array<{ role: 
     }
 }
 
-// Modify createKayakoTicket function
+// Update createKayakoTicket to use async/await with the new async generateTicketSummary
 async function createKayakoTicket(conversation: ConversationState, mp3Path?: string): Promise<void> {
     console.log('Starting Kayako ticket creation...');
 
@@ -994,11 +1140,7 @@ async function createKayakoTicket(conversation: ConversationState, mp3Path?: str
     }
 
     try {
-        console.log('Generating ticket summary...');
-        const ticketInfo = generateTicketSummary(conversation);
-        console.log('Generated ticket info:', ticketInfo);
-
-        // Get audio transcript and parse it with AI
+        // Get audio transcript and parse it with AI first, so we can use it for ticket summary
         let audioTranscript: string | undefined;
         let parsedTranscript: Array<{ role: 'agent' | 'customer', text: string }> = [];
 
@@ -1010,95 +1152,37 @@ async function createKayakoTicket(conversation: ConversationState, mp3Path?: str
                 // Parse transcript with AI
                 parsedTranscript = await parseTranscriptWithAI(audioTranscript);
                 console.log('Parsed transcript:', parsedTranscript);
+
+                // Update conversation state with the parsed transcript if it's empty or incomplete
+                if (conversation.transcript.length <= 4 && parsedTranscript.length > 0) {
+                    console.log('Updating conversation state with parsed transcript data');
+
+                    // Clear existing transcript
+                    conversation.transcript = [];
+
+                    // Add parsed messages to transcript
+                    parsedTranscript.forEach(message => {
+                        conversation.transcript.push({
+                            role: message.role === 'customer' ? 'user' : 'assistant',
+                            content: message.text,
+                            timestamp: Date.now() - Math.floor(Math.random() * 60000) // Approximate timestamps
+                        });
+                    });
+
+                    console.log('Updated conversation transcript with', conversation.transcript.length, 'messages');
+                }
             } catch (error) {
                 console.error('Failed to transcribe or parse audio file:', error);
             }
         }
 
-        // Upload MP3 file if available
+        console.log('Generating ticket summary...');
+        const ticketInfo = await generateTicketSummary(conversation, parsedTranscript);
+        console.log('Generated ticket info:', ticketInfo);
+
+        // Skip MP3 file upload entirely
         let attachmentId = '';
-        if (mp3Path && fs.existsSync(mp3Path)) {
-            console.log('Uploading call recording...');
-            const form = new FormData();
-            const fileName = path.basename(mp3Path);
-
-            form.append('name', fileName);
-            form.append('content', `Call Recording - ${fileName}`);
-            form.append('file', fs.createReadStream(mp3Path), {
-                filename: fileName,
-                contentType: 'audio/mp3'
-            });
-
-            // Log the form contents
-            console.log('Form fields:', {
-                name: fileName,
-                content: `Call Recording - ${fileName}`,
-                file: `<Stream of ${fileName}>`
-            });
-
-            // Create promise for the request
-            const uploadPromise = new Promise((resolve, reject) => {
-                const url = new URL(`${KAYAKO_CONFIG.baseUrl}/files`);
-                const auth = Buffer.from(`${KAYAKO_CONFIG.username}:${KAYAKO_CONFIG.password}`).toString('base64');
-
-                const options = {
-                    method: 'POST',
-                    host: url.hostname,
-                    path: `${url.pathname}${url.search}`,
-                    headers: {
-                        Authorization: `Basic ${auth}`,
-                        ...form.getHeaders()
-                    }
-                };
-
-                console.log('Making file upload request to:', `${url.protocol}//${url.host}${options.path}`);
-
-                const req = (url.protocol === 'https:' ? https : http).request(options, (res) => {
-                    let data = '';
-                    res.on('data', chunk => {
-                        data += chunk;
-                        console.log('Received chunk:', chunk.toString());
-                    });
-                    res.on('end', () => {
-                        console.log('Full response:', data);
-                        console.log('Response status:', res.statusCode);
-                        console.log('Response headers:', res.headers);
-
-                        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-                            try {
-                                const response = JSON.parse(data);
-                                if (!response.id) {
-                                    reject(new Error(`Upload succeeded but no attachment ID in response: ${data}`));
-                                    return;
-                                }
-                                resolve(response);
-                            } catch (e) {
-                                reject(new Error(`Failed to parse response: ${data}`));
-                            }
-                        } else {
-                            reject(new Error(`Upload failed with status ${res.statusCode}: ${data}`));
-                        }
-                    });
-                });
-
-                req.on('error', (error) => {
-                    console.error('Request error:', error);
-                    reject(error);
-                });
-
-                // Log what we're sending
-                console.log('Sending form data with fields:', form.getBoundary());
-                form.pipe(req);
-            });
-
-            try {
-                const attachmentData = await uploadPromise as KayakoAttachmentResponse;
-                attachmentId = attachmentData.id;
-                console.log('Successfully uploaded recording, attachment ID:', attachmentId);
-            } catch (error) {
-                console.error('Failed to upload recording:', error);
-            }
-        }
+        console.log('Skipping call recording upload to avoid attachment issues');
 
         if (ticketInfo.email && !conversation.userDetails.email) {
             conversation.userDetails.email = ticketInfo.email;
@@ -1107,6 +1191,14 @@ async function createKayakoTicket(conversation: ConversationState, mp3Path?: str
         if (ticketInfo.requiresFollowup) {
             conversation.requiresHumanFollowup = true;
         }
+
+        // Extract variables needed for ticket content
+        const aiResponses = conversation.transcript
+            .filter(e => e.role === 'assistant')
+            .map(e => e.content);
+        const noKBMatch = aiResponses.some((resp: string) => checkForNoKBMatch(resp));
+        const hasNegativeResponse = ticketInfo.unresolvedQuestions.length > 0;
+        const topicKeywords: string[] = [];
 
         // Combine transcript and raw input chronologically
         const allInteractions = [
@@ -1139,33 +1231,103 @@ async function createKayakoTicket(conversation: ConversationState, mp3Path?: str
             })
             .join('\n\n');
 
+        // Add resolved and unresolved questions to the ticket content
+        const resolvedQuestionsHtml = ticketInfo.resolvedQuestions.length > 0
+            ? `<div style="margin-bottom: 20px; background-color: #e6ffed; padding: 15px; border-radius: 4px; border-left: 4px solid #28a745;">
+                <strong>✅ RESOLVED QUESTIONS</strong><br>
+                <ul style="margin-top: 10px; margin-bottom: 0;">
+                    ${ticketInfo.resolvedQuestions.map(q => `<li>${q}</li>`).join('\n')}
+                </ul>
+              </div>`
+            : '';
+
+        const unresolvedQuestionsHtml = ticketInfo.unresolvedQuestions.length > 0
+            ? `<div style="margin-bottom: 20px; background-color: #ffebe9; padding: 15px; border-radius: 4px; border-left: 4px solid #d73a49;">
+                <strong>❓ UNRESOLVED QUESTIONS</strong><br>
+                <ul style="margin-top: 10px; margin-bottom: 0;">
+                    ${ticketInfo.unresolvedQuestions.map(q => `<li>${q}</li>`).join('\n')}
+                </ul>
+              </div>`
+            : '';
+
+        // Add customer sentiment section
+        const sentimentHtml = `<div style="margin-bottom: 20px; background-color: ${ticketInfo.requiresFollowup
+            ? '#fff8c5; border-left: 4px solid #f9c513'
+            : '#e6ffed; border-left: 4px solid #28a745'
+            }; padding: 15px; border-radius: 4px;">
+            <strong>${ticketInfo.requiresFollowup
+                ? '⚠️ FOLLOW-UP REQUIRED'
+                : '👍 NO FOLLOW-UP NEEDED'
+            }</strong><br>
+            <p style="margin-top: 10px; margin-bottom: 0;">
+                ${ticketInfo.requiresFollowup
+                ? `Reason: ${ticketInfo.unresolvedQuestions.length > 0
+                    ? 'Unresolved questions remain'
+                    : noKBMatch
+                        ? 'No knowledge base match found'
+                        : hasNegativeResponse
+                            ? 'Customer expressed dissatisfaction'
+                            : 'General follow-up required'
+                }`
+                : 'All questions were resolved successfully and the customer expressed satisfaction.'
+            }
+            </p>
+        </div>`;
+
+        // Add topic keywords section if available
+        const topicKeywordsHtml = topicKeywords.length > 0
+            ? `<div style="margin-bottom: 20px; background-color: #f6f8fa; padding: 15px; border-radius: 4px; border-left: 4px solid #0366d6;">
+                <strong>🔑 KEY TOPICS</strong><br>
+                <p style="margin-top: 10px; margin-bottom: 0;">
+                    ${topicKeywords.map(keyword => `<span style="display: inline-block; background-color: #e1e4e8; padding: 2px 8px; margin: 2px; border-radius: 12px;">${keyword}</span>`).join(' ')}
+                </p>
+              </div>`
+            : '';
+
         const ticketContent = `
 <div style="font-family: Arial, sans-serif; line-height: 1.6;">
-    <div style="margin-bottom: 20px;">
-        <strong>SUBJECT</strong><br>
-        ${ticketInfo.subject}
+    <div style="margin-bottom: 20px; background-color: #f6f8fa; padding: 15px; border-radius: 4px; border-left: 4px solid #0366d6;">
+        <strong>📋 SUBJECT</strong><br>
+        <p style="margin-top: 10px; margin-bottom: 0; font-size: 16px;">${ticketInfo.subject}</p>
     </div>
 
-    <div style="margin-bottom: 20px;">
-        <strong>SUMMARY</strong><br>
-        ${ticketInfo.summary}
+    <div style="margin-bottom: 20px; background-color: #f6f8fa; padding: 15px; border-radius: 4px; border-left: 4px solid #0366d6;">
+        <strong>📝 SUMMARY</strong><br>
+        <p style="margin-top: 10px; margin-bottom: 0;">${ticketInfo.summary}</p>
     </div>
 
-    <div style="margin-bottom: 20px;">
-        <strong>PRIORITY ESTIMATE</strong><br>
-        ${ticketInfo.requiresFollowup ? 'HIGH' : 'LOW'}
+    <div style="margin-bottom: 20px; background-color: ${ticketInfo.priority === 'HIGH'
+                ? '#ffebe9; border-left: 4px solid #d73a49'
+                : ticketInfo.priority === 'MEDIUM'
+                    ? '#fff8c5; border-left: 4px solid #f9c513'
+                    : '#e6ffed; border-left: 4px solid #28a745'
+            }; padding: 15px; border-radius: 4px;">
+        <strong>🔔 PRIORITY: ${ticketInfo.priority}</strong><br>
+        <p style="margin-top: 10px; margin-bottom: 0;">
+            ${ticketInfo.priority === 'HIGH'
+                ? 'Requires immediate attention'
+                : ticketInfo.priority === 'MEDIUM'
+                    ? 'Should be addressed soon'
+                    : 'Can be addressed when convenient'
+            }
+        </p>
     </div>
+    
+    ${sentimentHtml}
+    ${topicKeywordsHtml}
+    ${resolvedQuestionsHtml}
+    ${unresolvedQuestionsHtml}
 
     ${parsedTranscript.length > 0 ? `
     <div style="margin-bottom: 20px;">
-        <strong>CALL TRANSCRIPT</strong><br>
-        <div style="background: #f5f5f5; padding: 15px; border-radius: 4px; margin: 10px 0;">
+        <strong>📞 CALL TRANSCRIPT</strong><br>
+        <div style="background: #f5f5f5; padding: 15px; border-radius: 4px; margin: 10px 0; max-height: 400px; overflow-y: auto;">
             ${parsedTranscript.map(message => `
-                <div style="margin-bottom: 10px;">
+                <div style="margin-bottom: 10px; padding: 8px; background-color: ${message.role === 'agent' ? '#e3f2fd' : '#f3e5f5'}; border-radius: 4px;">
                     <span style="color: ${message.role === 'agent' ? '#2c5282' : '#805ad5'}; font-weight: bold;">
                         ${message.role === 'agent' ? 'Agent' : 'Customer'}: 
                     </span>
-                    <span style="color: ${message.role === 'agent' ? '#2c5282' : '#805ad5'};">
+                    <span>
                         ${message.text}
                     </span>
                 </div>
@@ -1175,12 +1337,19 @@ async function createKayakoTicket(conversation: ConversationState, mp3Path?: str
     ` : ''}
 </div>`;
 
+        // Map priority to Kayako priority IDs
+        const priorityIdMap = {
+            'HIGH': '3',   // High priority
+            'MEDIUM': '2', // Medium priority
+            'LOW': '1'     // Low priority
+        };
+
         const ticket: KayakoTicket = {
             field_values: {
                 product: "80"
             },
             status_id: "1",
-            attachment_file_ids: attachmentId ? [attachmentId] : [],
+            attachment_file_ids: [], // Empty array instead of using attachmentId
             tags: "gauntlet-ai",
             type_id: 7,
             channel: "MAIL",
@@ -1190,7 +1359,7 @@ async function createKayakoTicket(conversation: ConversationState, mp3Path?: str
             assigned_team_id: KAYAKO_CONFIG.defaultTeam,
             requester_id: KAYAKO_CONFIG.defaultAgent,
             channel_id: "1",
-            priority_id: ticketInfo.requiresFollowup ? "2" : "1",
+            priority_id: priorityIdMap[ticketInfo.priority] || '2', // Default to medium if mapping fails
             channel_options: {
                 cc: [],
                 html: true
@@ -1220,4 +1389,183 @@ async function createKayakoTicket(conversation: ConversationState, mp3Path?: str
         console.error('Error in createKayakoTicket:', error);
         throw error;
     }
+}
+
+// Update generateTicketSummary to accept parsedTranscript as an optional parameter
+async function generateTicketSummary(
+    conversation: ConversationState,
+    parsedTranscript?: Array<{ role: 'agent' | 'customer', text: string }>
+): Promise<{
+    subject: string;
+    summary: string;
+    email: string | null;
+    requiresFollowup: boolean;
+    priority: 'HIGH' | 'MEDIUM' | 'LOW';
+    resolvedQuestions: string[];
+    unresolvedQuestions: string[];
+}> {
+    const allMessages = conversation.transcript.map(e => e.content);
+    const userMessages = conversation.transcript
+        .filter(e => e.role === 'user')
+        .map(e => e.content);
+    const aiResponses = conversation.transcript
+        .filter(e => e.role === 'assistant')
+        .map(e => e.content);
+
+    const email = conversation.userDetails.email || extractEmailFromMessages(allMessages);
+
+    // Extract questions from user messages
+    const userQuestions = extractUserQuestions(conversation.transcript);
+    console.log('Extracted user questions:', userQuestions);
+
+    // If we have a parsed transcript and few user messages, extract questions from the parsed transcript
+    if (parsedTranscript && parsedTranscript.length > 0 && userMessages.length < 2) {
+        console.log('Using parsed transcript for question extraction');
+        const transcriptFormatted = parsedTranscript.map(msg => ({
+            role: msg.role === 'customer' ? 'user' : 'assistant',
+            content: msg.text
+        }));
+
+        const additionalQuestions = extractUserQuestions(transcriptFormatted);
+        console.log('Additional questions from parsed transcript:', additionalQuestions);
+
+        // Add unique questions
+        additionalQuestions.forEach(q => {
+            if (!userQuestions.includes(q)) {
+                userQuestions.push(q);
+            }
+        });
+
+        console.log('Combined questions:', userQuestions);
+    }
+
+    // Analyze conversation flow to determine resolution status
+    let resolvedQuestions: string[] = [];
+    let unresolvedQuestions: string[] = [];
+    let hasPositiveAcknowledgment = false;
+    let hasNegativeResponse = false;
+    let topicKeywords: string[] = [];
+
+    // If we have a parsed transcript and few messages in the conversation state,
+    // use the parsed transcript for analysis instead
+    if (parsedTranscript && parsedTranscript.length > 0 && conversation.transcript.length <= 4) {
+        console.log('Using parsed transcript for conversation analysis');
+        const transcriptFormatted = parsedTranscript.map(msg => ({
+            role: msg.role === 'customer' ? 'user' : 'assistant',
+            content: msg.text
+        }));
+
+        const analysisResult = await analyzeConversationResolution(transcriptFormatted, userQuestions);
+        resolvedQuestions = analysisResult.resolvedQuestions;
+        unresolvedQuestions = analysisResult.unresolvedQuestions;
+        hasPositiveAcknowledgment = analysisResult.hasPositiveAcknowledgment;
+        hasNegativeResponse = analysisResult.hasNegativeResponse;
+        topicKeywords = analysisResult.topicKeywords;
+    } else {
+        // Use the conversation state transcript
+        const analysisResult = await analyzeConversationResolution(conversation.transcript, userQuestions);
+        resolvedQuestions = analysisResult.resolvedQuestions;
+        unresolvedQuestions = analysisResult.unresolvedQuestions;
+        hasPositiveAcknowledgment = analysisResult.hasPositiveAcknowledgment;
+        hasNegativeResponse = analysisResult.hasNegativeResponse;
+        topicKeywords = analysisResult.topicKeywords;
+    }
+
+    console.log('Resolution analysis:', {
+        resolvedQuestions,
+        unresolvedQuestions,
+        hasPositiveAcknowledgment,
+        hasNegativeResponse
+    });
+
+    // Check if AI couldn't find information in KB
+    const noKBMatch = aiResponses.some(resp => checkForNoKBMatch(resp));
+
+    // Determine if follow-up is required based on multiple factors
+    const requiresFollowup =
+        noKBMatch ||
+        unresolvedQuestions.length > 0 ||
+        hasNegativeResponse ||
+        conversation.requiresHumanFollowup;
+
+    // Determine priority based on resolution status and conversation analysis
+    let priority: 'HIGH' | 'MEDIUM' | 'LOW' = 'MEDIUM';
+
+    if (requiresFollowup) {
+        if (unresolvedQuestions.length > 0 || noKBMatch) {
+            priority = 'HIGH'; // High priority for unresolved questions or no KB match
+        } else {
+            priority = 'MEDIUM'; // Medium priority for other follow-up reasons
+        }
+    } else if (resolvedQuestions.length > 0 && unresolvedQuestions.length === 0 && hasPositiveAcknowledgment) {
+        priority = 'LOW'; // Low priority for fully resolved conversations with positive acknowledgment
+    }
+
+    // Generate subject from first meaningful user message
+    let subject = 'New Support Call';
+
+    // If we have parsed transcript and no meaningful user message, use the first customer message
+    if (parsedTranscript && parsedTranscript.length > 0 && userMessages.length === 0) {
+        const firstCustomerMsg = parsedTranscript.find(msg => msg.role === 'customer');
+        if (firstCustomerMsg) {
+            subject = firstCustomerMsg.text.substring(0, 100);
+        }
+    } else if (userMessages.length > 0) {
+        const firstMeaningful = userMessages.find(msg => !msg.match(/^[\\w.-]+@[\\w.-]+\\.\w+$/));
+        if (firstMeaningful) {
+            subject = firstMeaningful.substring(0, 100);
+        }
+    }
+
+    // Generate more detailed summary
+    let summary = '';
+
+    if (userQuestions.length > 0) {
+        const questionSummary = userQuestions.length === 1
+            ? `"${userQuestions[0]}"`
+            : `multiple questions including "${userQuestions[0]}"`;
+
+        summary += `The customer inquired about ${questionSummary}. `;
+    } else {
+        summary += `The customer contacted support about ${topicKeywords.join(', ') || 'Kayako services'}. `;
+    }
+
+    if (aiResponses.length > 0) {
+        summary += `The AI provided assistance with ${generateKeyPoints(conversation.transcript)}. `;
+    }
+
+    if (resolvedQuestions.length > 0) {
+        summary += `Successfully resolved: ${resolvedQuestions.join(', ')}. `;
+    }
+
+    if (unresolvedQuestions.length > 0) {
+        summary += `Questions requiring follow-up: ${unresolvedQuestions.join(', ')}. `;
+    }
+
+    if (requiresFollowup) {
+        if (noKBMatch) {
+            summary += 'The conversation requires human follow-up as the AI could not find relevant information in the knowledge base. ';
+        } else if (hasNegativeResponse) {
+            summary += 'The customer expressed dissatisfaction with the provided information. ';
+        } else if (unresolvedQuestions.length > 0) {
+            summary += 'Some questions could not be fully addressed by the AI. ';
+        } else {
+            summary += 'The conversation requires human follow-up. ';
+        }
+    } else {
+        summary += 'The AI successfully resolved all customer inquiries. ';
+        if (hasPositiveAcknowledgment) {
+            summary += 'The customer expressed satisfaction with the provided information. ';
+        }
+    }
+
+    return {
+        subject,
+        summary,
+        email,
+        requiresFollowup,
+        priority,
+        resolvedQuestions,
+        unresolvedQuestions
+    };
 }
