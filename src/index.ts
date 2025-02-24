@@ -265,6 +265,42 @@ function checkForNoKBMatch(response: string): boolean {
     return noMatchPhrases.some(phrase => response.toLowerCase().includes(phrase.toLowerCase()));
 }
 
+// Helper: extract email from text
+function extractEmail(text: string): string | null {
+    // First try to match standard email format
+    const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+    const match = text.match(emailRegex);
+    if (match) {
+        return match[0];
+    }
+
+    // If no standard email found, try to match spoken email format with more variations
+    // Handle formats like:
+    // - "philly at gmail dot com"
+    // - "philly at gmail period com"
+    // - "philly (at) gmail (dot) com"
+    // - "philly AT gmail DOT com"
+    const spokenEmailRegex = /\b([a-zA-Z0-9._%+-]+)\s+(?:at|\(at\)|@)\s+([a-zA-Z0-9.-]+)\s+(?:dot|\(dot\)|period|\.)\s+([a-zA-Z]{2,})\b/i;
+    const spokenMatch = text.match(spokenEmailRegex);
+    if (spokenMatch) {
+        // Convert "philly at gmail dot com" to "philly@gmail.com"
+        return `${spokenMatch[1]}@${spokenMatch[2]}.${spokenMatch[3]}`;
+    }
+
+    return null;
+}
+
+// Helper: extract email from an array of messages
+function extractEmailFromMessages(messages: string[]): string | null {
+    for (const msg of messages) {
+        const email = extractEmail(msg);
+        if (email) {
+            return email;
+        }
+    }
+    return null;
+}
+
 // Root route
 fastify.get('/', async (_request: FastifyRequest, reply: FastifyReply) => {
     reply.send({ message: 'Twilio Media Stream Server is running!' });
@@ -352,13 +388,6 @@ Remember: Always get the email first, then help with Kayako-related questions on
                 'OpenAI-Beta': 'realtime=v1',
             },
         });
-
-        // Helper: extract email from text
-        function extractEmail(text: string): string | null {
-            const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
-            const match = text.match(emailRegex);
-            return match ? match[0] : null;
-        }
 
         // Send G711 silence
         function sendSilence() {
@@ -823,16 +852,6 @@ start();
  * unchanged except for referencing them in the final code.
  */
 
-function extractEmailFromMessages(messages: string[]): string | null {
-    for (const msg of messages) {
-        const match = msg.match(/[\w.-]+@[\w.-]+\.\w+$/);
-        if (match) {
-            return match[0];
-        }
-    }
-    return null;
-}
-
 /**
  * Extract questions from user messages in the transcript
  */
@@ -1089,14 +1108,20 @@ async function parseTranscriptWithAI(transcript: string): Promise<Array<{ role: 
                      - Customer responses are usually informal and include questions or provide information
                      - The conversation follows a typical pattern: agent asks for info -> customer provides -> agent confirms
                      
+                     IMPORTANT INSTRUCTIONS:
+                     1. If the customer provides an email address in any format (standard or spoken like "name at domain dot com"), 
+                        preserve it EXACTLY as spoken in the text field.
+                     2. If the agent confirms an email address (e.g., "I've noted your email as..."), preserve the EXACT confirmation
+                        including the email address as spoken.
+                     3. Do not convert spoken email formats (like "name at domain dot com") to standard format ("name@domain.com").
+                        Keep them exactly as they appear in the transcript.
+                     
                      Format your response as a JSON object with a "messages" array where each element has:
                      - role: either "agent" or "customer"
-                     - text: the exact text spoken
-
-                     Maintain the exact sequence and content of the conversation.`
+                     - text: the exact text spoken, with special attention to preserving email addresses exactly as spoken`
         }, {
             role: "user",
-            content: `Parse this customer support transcript into a structured conversation, carefully separating agent and customer messages: ${transcript}`
+            content: `Parse this customer support transcript into a structured conversation, carefully separating agent and customer messages, and preserving any email addresses exactly as spoken: ${transcript}`
         }],
         response_format: { type: "json_object" },
         temperature: 0.1
@@ -1153,6 +1178,17 @@ async function createKayakoTicket(conversation: ConversationState, mp3Path?: str
                 parsedTranscript = await parseTranscriptWithAI(audioTranscript);
                 console.log('Parsed transcript:', parsedTranscript);
 
+                // Special check for spoken email format in the transcript
+                const fullTranscriptText = audioTranscript || '';
+                const spokenEmailRegex = /\b([a-zA-Z0-9._%+-]+)\s+at\s+([a-zA-Z0-9.-]+)\s+dot\s+([a-zA-Z]{2,})\b/i;
+                const spokenMatch = fullTranscriptText.match(spokenEmailRegex);
+                if (spokenMatch) {
+                    const email = `${spokenMatch[1]}@${spokenMatch[2]}.${spokenMatch[3]}`;
+                    console.log('Found spoken email in full transcript:', email);
+                    conversation.userDetails.email = email;
+                    conversation.userDetails.hasProvidedEmail = true;
+                }
+
                 // Update conversation state with the parsed transcript if it's empty or incomplete
                 if (conversation.transcript.length <= 4 && parsedTranscript.length > 0) {
                     console.log('Updating conversation state with parsed transcript data');
@@ -1170,6 +1206,69 @@ async function createKayakoTicket(conversation: ConversationState, mp3Path?: str
                     });
 
                     console.log('Updated conversation transcript with', conversation.transcript.length, 'messages');
+                }
+
+                // Extract email from parsed transcript
+                if (parsedTranscript.length > 0 && !conversation.userDetails.email) {
+                    console.log('Checking parsed transcript for email...');
+
+                    // Helper function to extract email - defined inline to avoid scope issues
+                    const extractEmailFromText = (text: string): string | null => {
+                        // First try to match standard email format
+                        const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+                        const match = text.match(emailRegex);
+                        if (match) {
+                            return match[0];
+                        }
+
+                        // If no standard email found, try to match spoken email format with more variations
+                        // Handle formats like:
+                        // - "philly at gmail dot com"
+                        // - "philly at gmail period com"
+                        // - "philly (at) gmail (dot) com"
+                        // - "philly AT gmail DOT com"
+                        const spokenEmailRegex = /\b([a-zA-Z0-9._%+-]+)\s+(?:at|\(at\)|@)\s+([a-zA-Z0-9.-]+)\s+(?:dot|\(dot\)|period|\.)\s+([a-zA-Z]{2,})\b/i;
+                        const spokenMatch = text.match(spokenEmailRegex);
+                        if (spokenMatch) {
+                            // Convert "philly at gmail dot com" to "philly@gmail.com"
+                            return `${spokenMatch[1]}@${spokenMatch[2]}.${spokenMatch[3]}`;
+                        }
+
+                        return null;
+                    };
+
+                    // Check each customer message for an email
+                    for (const message of parsedTranscript) {
+                        if (message.role === 'customer') {
+                            const email = extractEmailFromText(message.text);
+                            if (email) {
+                                console.log('Found email in parsed transcript:', email);
+                                conversation.userDetails.email = email;
+                                conversation.userDetails.hasProvidedEmail = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Also check agent messages that might confirm the email
+                    if (!conversation.userDetails.email) {
+                        for (const message of parsedTranscript) {
+                            if (message.role === 'agent' &&
+                                (message.text.includes("I've noted your email as") ||
+                                    message.text.includes("noted your email as"))) {
+                                const emailMatch = message.text.match(/noted your email as\s+([^.]+)/i);
+                                if (emailMatch && emailMatch[1]) {
+                                    const potentialEmail = extractEmailFromText(emailMatch[1]);
+                                    if (potentialEmail) {
+                                        console.log('Found email in agent confirmation:', potentialEmail);
+                                        conversation.userDetails.email = potentialEmail;
+                                        conversation.userDetails.hasProvidedEmail = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             } catch (error) {
                 console.error('Failed to transcribe or parse audio file:', error);
@@ -1292,6 +1391,11 @@ async function createKayakoTicket(conversation: ConversationState, mp3Path?: str
     </div>
 
     <div style="margin-bottom: 20px; background-color: #f6f8fa; padding: 15px; border-radius: 4px; border-left: 4px solid #0366d6;">
+        <strong>📧 CUSTOMER EMAIL</strong><br>
+        <p style="margin-top: 10px; margin-bottom: 0; font-size: 16px;">${ticketInfo.email || 'Not provided'}</p>
+    </div>
+
+    <div style="margin-bottom: 20px; background-color: #f6f8fa; padding: 15px; border-radius: 4px; border-left: 4px solid #0366d6;">
         <strong>📝 SUMMARY</strong><br>
         <p style="margin-top: 10px; margin-bottom: 0;">${ticketInfo.summary}</p>
     </div>
@@ -1357,7 +1461,12 @@ async function createKayakoTicket(conversation: ConversationState, mp3Path?: str
             contents: ticketContent,
             assigned_agent_id: KAYAKO_CONFIG.defaultAgent,
             assigned_team_id: KAYAKO_CONFIG.defaultTeam,
-            requester_id: KAYAKO_CONFIG.defaultAgent,
+            // TODO: Future enhancement - Create a user in Kayako with the provided email
+            // Currently using default agent as requester, but ideally we would:
+            // 1. Check if a user with this email exists in Kayako
+            // 2. If not, create a new user with the email
+            // 3. Use that user's ID as the requester_id
+            requester_id: KAYAKO_CONFIG.defaultAgent, // Currently using default agent
             channel_id: "1",
             priority_id: priorityIdMap[ticketInfo.priority] || '2', // Default to medium if mapping fails
             channel_options: {
@@ -1365,6 +1474,15 @@ async function createKayakoTicket(conversation: ConversationState, mp3Path?: str
                 html: true
             }
         };
+
+        // If we have the user's email, add it to the cc field so they receive a copy of the ticket
+        if (ticketInfo.email) {
+            // Don't add to cc field as it's causing API validation errors
+            // Instead, we're already displaying it prominently in the ticket content
+            console.log(`Email ${ticketInfo.email} will be displayed in ticket content but not added to cc field`);
+            // Keep cc as an empty array to avoid validation errors
+            ticket.channel_options.cc = [];
+        }
 
         console.log('Sending ticket to Kayako API:', JSON.stringify(ticket, null, 2));
 
@@ -1412,32 +1530,77 @@ async function generateTicketSummary(
         .filter(e => e.role === 'assistant')
         .map(e => e.content);
 
-    const email = conversation.userDetails.email || extractEmailFromMessages(allMessages);
+    // Enhanced email extraction
+    let email: string | null = conversation.userDetails.email || null;
+
+    // If no email in conversation state, try to extract from parsed transcript
+    if (!email && parsedTranscript && parsedTranscript.length > 0) {
+        console.log('Checking parsed transcript for email in generateTicketSummary');
+
+        // Check each customer message for an email
+        for (const message of parsedTranscript) {
+            if (message.role === 'customer') {
+                // Try standard email format
+                const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+                const match = message.text.match(emailRegex);
+                if (match) {
+                    email = match[0];
+                    console.log('Found standard email in parsed transcript:', email);
+                    break;
+                }
+
+                // Try spoken email format
+                const spokenEmailRegex = /\b([a-zA-Z0-9._%+-]+)\s+at\s+([a-zA-Z0-9.-]+)\s+dot\s+([a-zA-Z]{2,})\b/i;
+                const spokenMatch = message.text.match(spokenEmailRegex);
+                if (spokenMatch) {
+                    email = `${spokenMatch[1]}@${spokenMatch[2]}.${spokenMatch[3]}`;
+                    console.log('Found spoken email in parsed transcript:', email);
+                    break;
+                }
+            }
+        }
+
+        // If still no email, check agent confirmations
+        if (!email) {
+            for (const message of parsedTranscript) {
+                if (message.role === 'agent' &&
+                    (message.text.includes("I've noted your email as") ||
+                        message.text.includes("noted your email as"))) {
+                    const emailMatch = message.text.match(/noted your email as\s+([^.]+)/i);
+                    if (emailMatch && emailMatch[1]) {
+                        // Try standard email format in the confirmation
+                        const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+                        const match = emailMatch[1].match(emailRegex);
+                        if (match) {
+                            email = match[0];
+                            console.log('Found standard email in agent confirmation:', email);
+                            break;
+                        }
+
+                        // Try spoken email format in the confirmation
+                        const spokenEmailRegex = /\b([a-zA-Z0-9._%+-]+)\s+at\s+([a-zA-Z0-9.-]+)\s+dot\s+([a-zA-Z]{2,})\b/i;
+                        const spokenMatch = emailMatch[1].match(spokenEmailRegex);
+                        if (spokenMatch) {
+                            email = `${spokenMatch[1]}@${spokenMatch[2]}.${spokenMatch[3]}`;
+                            console.log('Found spoken email in agent confirmation:', email);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // If still no email, try to extract from all messages
+    if (!email) {
+        email = extractEmailFromMessages(allMessages) || null;
+    }
+
+    console.log('Final email determined for ticket:', email);
 
     // Extract questions from user messages
     const userQuestions = extractUserQuestions(conversation.transcript);
     console.log('Extracted user questions:', userQuestions);
-
-    // If we have a parsed transcript and few user messages, extract questions from the parsed transcript
-    if (parsedTranscript && parsedTranscript.length > 0 && userMessages.length < 2) {
-        console.log('Using parsed transcript for question extraction');
-        const transcriptFormatted = parsedTranscript.map(msg => ({
-            role: msg.role === 'customer' ? 'user' : 'assistant',
-            content: msg.text
-        }));
-
-        const additionalQuestions = extractUserQuestions(transcriptFormatted);
-        console.log('Additional questions from parsed transcript:', additionalQuestions);
-
-        // Add unique questions
-        additionalQuestions.forEach(q => {
-            if (!userQuestions.includes(q)) {
-                userQuestions.push(q);
-            }
-        });
-
-        console.log('Combined questions:', userQuestions);
-    }
 
     // Analyze conversation flow to determine resolution status
     let resolvedQuestions: string[] = [];
@@ -1535,28 +1698,7 @@ async function generateTicketSummary(
     }
 
     if (resolvedQuestions.length > 0) {
-        summary += `Successfully resolved: ${resolvedQuestions.join(', ')}. `;
-    }
-
-    if (unresolvedQuestions.length > 0) {
-        summary += `Questions requiring follow-up: ${unresolvedQuestions.join(', ')}. `;
-    }
-
-    if (requiresFollowup) {
-        if (noKBMatch) {
-            summary += 'The conversation requires human follow-up as the AI could not find relevant information in the knowledge base. ';
-        } else if (hasNegativeResponse) {
-            summary += 'The customer expressed dissatisfaction with the provided information. ';
-        } else if (unresolvedQuestions.length > 0) {
-            summary += 'Some questions could not be fully addressed by the AI. ';
-        } else {
-            summary += 'The conversation requires human follow-up. ';
-        }
-    } else {
-        summary += 'The AI successfully resolved all customer inquiries. ';
-        if (hasPositiveAcknowledgment) {
-            summary += 'The customer expressed satisfaction with the provided information. ';
-        }
+        summary += `Successfully resolved ${resolvedQuestions.length} question(s). `;
     }
 
     return {
