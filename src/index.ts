@@ -10,13 +10,16 @@ import FormData from 'form-data';
 import { OpenAI } from 'openai';
 import https from 'https';
 import http from 'http';
-import { shouldForwardCall, transferCallToAgent, getCallSidFromStreamSid } from './call-forwarding.js';
+import { transferCallToAgent, getCallSidFromStreamSid, evaluateForwardingWithLLM } from './call-forwarding.js';
 import pkg from 'twilio';
 import os from 'os';
 const { Twilio } = pkg;
 
 // Load environment variables
 dotenv.config();
+
+// Configuration
+const ENABLE_CALL_FORWARDING = process.env.ENABLE_CALL_FORWARDING === 'true';
 
 // Check all required environment variables
 const requiredEnvVars = [
@@ -34,6 +37,9 @@ for (const envVar of requiredEnvVars) {
         process.exit(1);
     }
 }
+
+// Near the top of the file, add these declarations
+const FORWARDING_THRESHOLD = parseInt(process.env.FORWARDING_THRESHOLD || '3', 10);
 
 // Knowledge base interfaces
 interface KnowledgeArticle {
@@ -321,10 +327,9 @@ function extractEmailFromMessages(messages: Array<{ role: 'user' | 'assistant', 
 // Initialize Twilio client
 const twilioClient = new Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-// Buffer for collecting audio for Whisper transcription
-let whisperAudioBuffer: Buffer[] = [];
-let lastWhisperTranscriptionTime = 0;
+// Initialize variables for WebSocket connection
 const WHISPER_TRANSCRIPTION_INTERVAL = 3000; // 3 seconds
+const FORWARDING_CHECK_INTERVAL = 15000; // 15 seconds between forwarding checks (reduced from 60 seconds)
 
 /**
  * Check if a message contains a request to speak with a human agent
@@ -357,7 +362,20 @@ function containsHumanAgentRequest(message: string): boolean {
         'human support',
         'need help from a person',
         'can i speak to',
-        'can i talk to'
+        'can i talk to',
+        'talk to your humans',
+        'talk to humans',
+        'speak with humans',
+        'connect to a human',
+        'human operator',
+        'live agent',
+        'live person',
+        'actual person',
+        'talk to someone else',
+        'speak to someone else',
+        'get me a human',
+        'i want a human',
+        'human please'
     ];
 
     return humanRequestPhrases.some(phrase => lowerMessage.includes(phrase));
@@ -420,12 +438,16 @@ async function processAudioWithWhisper(audioBuffer: Buffer[]): Promise<string | 
         fs.writeFileSync(tempFilePath, Buffer.concat([wavHeader, combinedPcm]));
 
         // Call Whisper API using the OpenAI instance
-        const openaiInstance = new OpenAI();
+        const openaiInstance = new OpenAI({
+            apiKey: process.env.OPENAI_API_KEY
+        });
         const transcription = await openaiInstance.audio.transcriptions.create({
             file: fs.createReadStream(tempFilePath),
             model: 'whisper-1',
             language: 'en',
-            response_format: 'json'
+            response_format: 'json',
+            temperature: 0.0,  // Lower temperature for more accurate transcriptions
+            prompt: 'This is a customer support call. The customer may be asking questions or describing technical issues.'  // Context helps improve accuracy
         });
 
         // Clean up temp file
@@ -493,6 +515,10 @@ fastify.register(async (fastify: FastifyInstance) => {
         let lastSpeechStartTime = 0;
         let isResponseFullyDone = false;
         let callForwardingChecked = false;
+        let lastForwardingCheckTime = 0;
+        let whisperAudioBuffer: Buffer[] = [];
+        let lastWhisperTranscriptionTime = 0;
+        const WHISPER_TRANSCRIPTION_INTERVAL = 3000; // 3 seconds
 
         // Initialize conversation state
         const conversationState: ConversationState = {
@@ -515,7 +541,8 @@ ${KNOWLEDGE_BASE_CONTEXT}
 
 IMPORTANT GUIDELINES:
 1. Your FIRST priority is to collect the user's email address. Before answering any question, say:
-   "Before I assist you, could you please provide your email address so I can follow up if needed?"
+   "Hello! To better assist you today, could you please share your email address with me?"
+
 2. Once you receive an email, confirm it by saying:
    "Thank you, I've noted your email as [email]. Now, how can I help you with Kayako?"
 3. ONLY after getting the email, proceed with these guidelines:
@@ -526,8 +553,10 @@ IMPORTANT GUIDELINES:
    - Use the knowledge base information to provide accurate answers
    - If you don't find a specific answer in the knowledge base, say:
      "I don't have specific information about that aspect of Kayako. I'll have a support specialist follow up with you at [email]."
+   - If the user asks to speak with a human agent at any point, acknowledge their request and say:
+     "I understand you'd like to speak with a human agent. I'll connect you with a support specialist right away."
 
-Remember: Always get the email first, then help with Kayako-related questions only.`;
+Remember: Always get the email first, then help with Kayako-related questions only. Users can request a human agent at any time by saying "speak to a human" or "talk to an agent".`;
 
         const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01', {
             headers: {
@@ -626,8 +655,9 @@ Remember: Always get the email first, then help with Kayako-related questions on
                 }
             }
 
-            // Check if we should forward the call to a human agent
-            if (role === 'user' && streamSid && !callForwardingChecked && conversationState.transcript.length >= 4) {
+            // Check if we should forward the call to a human agent after each AI response
+            if (role === 'assistant' && streamSid) {
+                // Always check for forwarding after AI responses
                 checkAndHandleCallForwarding();
             }
 
@@ -638,89 +668,114 @@ Remember: Always get the email first, then help with Kayako-related questions on
 
         // Function to check if call should be forwarded and handle the forwarding
         async function checkAndHandleCallForwarding() {
-            if (!streamSid) {
-                console.log('❌ Cannot check call forwarding: Stream SID not available');
+            // If call forwarding is disabled, skip this check
+            if (!ENABLE_CALL_FORWARDING) return;
+
+            console.log('Checking if call should be forwarded...');
+
+            // Add type declaration for the static property
+            interface CallForwardingFunction extends Function {
+                transferAttempted?: string;
+            }
+
+            // Track if a transfer was attempted in this session using typed property
+            const typedFunc = checkAndHandleCallForwarding as CallForwardingFunction;
+            if (typedFunc.transferAttempted === callSid && callSid !== null) {
+                console.log(`Transfer already attempted for call ${callSid}, skipping duplicate forwarding`);
                 return;
             }
 
-            if (callForwardingChecked) {
-                console.log('ℹ️ Call forwarding already checked for this call');
-                return;
+            // Check the last 7 user messages for explicit human agent requests
+            const recentMessages = conversationState.transcript
+                .slice(-7)
+                .filter(msg => msg.role === 'user')
+                .map(msg => msg.content);
+
+            // Check if any recent message contains a human agent request
+            const explicitRequest = recentMessages.some(message => containsHumanAgentRequest(message));
+
+            // Also check if the AI's responses indicate forwarding is needed
+            const aiResponses = conversationState.transcript
+                .slice(-7)
+                .filter(msg => msg.role === 'assistant')
+                .map(msg => msg.content);
+
+            const aiIndicatesForwarding = aiResponses.some(response => {
+                return response.toLowerCase().includes('human agent') ||
+                    response.toLowerCase().includes('support specialist') ||
+                    response.toLowerCase().includes('transfer you') ||
+                    response.toLowerCase().includes('connect you') ||
+                    response.toLowerCase().includes('prefer to speak with a human');
+            });
+
+            // Log the detection
+            if (explicitRequest) {
+                console.log('Explicit request for human agent detected');
             }
 
-            console.log('🔍 Checking if call should be forwarded...');
-            console.log(`- Stream SID: ${streamSid}`);
-            console.log(`- KB Match Found: ${conversationState.kbMatchFound}`);
-            console.log(`- Transcript Length: ${conversationState.transcript.length}`);
+            if (aiIndicatesForwarding) {
+                console.log('AI response indicates forwarding is appropriate');
+            }
 
-            // Mark as checked to prevent multiple checks
-            callForwardingChecked = true;
+            // Start with forwarding criteria
+            let shouldForward = explicitRequest || aiIndicatesForwarding;
 
-            try {
-                // Check if we should forward the call based on conversation context
-                const shouldForward = shouldForwardCall(
-                    conversationState.transcript,
-                    conversationState.kbMatchFound
-                );
+            // If not an explicit request, use LLM to evaluate
+            if (!shouldForward && conversationState.transcript.length >= FORWARDING_THRESHOLD) {
+                try {
+                    const result = await evaluateForwardingWithLLM(conversationState.transcript);
+                    console.log('LLM forwarding evaluation result:', result);
+                    shouldForward = result.shouldForward;
 
-                if (shouldForward) {
-                    console.log('🔄 Call forwarding criteria met, initiating transfer');
-
-                    // Get the Call SID if we don't have it yet
-                    if (!callSid) {
-                        console.log(`Retrieving Call SID from Stream SID: ${streamSid}`);
-                        callSid = await getCallSidFromStreamSid(streamSid);
-                        console.log(`Retrieved Call SID: ${callSid || 'null'}`);
+                    // Additional logging for easier debugging
+                    if (shouldForward) {
+                        console.log('LLM recommends forwarding because:', result.reason);
                     }
-
-                    // Set flag to indicate human followup is needed
-                    conversationState.requiresHumanFollowup = true;
-                    console.log('Set requiresHumanFollowup flag to true');
-
-                    // Inform the user that we're transferring them
-                    addToTranscript(
-                        'assistant',
-                        `I'll connect you with a support specialist who can better assist you with this issue. Please hold while I transfer your call.`
-                    );
-
-                    // Try to transfer the call if we have a Call SID
-                    if (callSid) {
-                        // Transfer the call
-                        console.log(`Transferring call ${callSid} to human agent...`);
-                        try {
-                            await transferCallToAgent(
-                                connection,
-                                callSid,
-                                streamSid,
-                                conversationState,
-                                addToTranscript
-                            );
-                            console.log('Call transfer process completed');
-                        } catch (transferError) {
-                            console.error('❌ Error in call transfer:', transferError);
-
-                            // Add message to transcript if not already added by transferCallToAgent
-                            if (connection.readyState === WebSocket.OPEN) {
-                                addToTranscript(
-                                    'assistant',
-                                    `I'm sorry, I'm having trouble connecting you with a specialist. Please try calling our support line directly at ${process.env.SUPPORT_AGENT_NUMBER || 'our support number'}.`
-                                );
-                            }
-                        }
-                    } else {
-                        console.error('❌ Cannot forward call: Call SID not available');
-                        // Add message to transcript
-                        addToTranscript(
-                            'assistant',
-                            `I'm sorry, I'm having trouble connecting you with a specialist. Please try calling our support line directly at ${process.env.SUPPORT_AGENT_NUMBER || 'our support number'}.`
-                        );
-                    }
-                } else {
-                    console.log('✅ Call forwarding not needed at this time');
+                } catch (error) {
+                    console.error('Error evaluating forwarding with LLM:', error);
                 }
-            } catch (error) {
-                console.error('❌ Error in call forwarding process:', error);
-                // Don't reset callForwardingChecked flag to prevent infinite loops
+            }
+
+            // Don't forward if we found a knowledge base match, unless explicitly requested
+            if (shouldForward && conversationState.kbMatchFound && !explicitRequest) {
+                console.log('KB match found, skipping forwarding unless explicitly requested');
+                shouldForward = false;
+            }
+
+            if (shouldForward) {
+                console.log('Preparing to forward call to human agent...');
+
+                try {
+                    // Only attempt to transfer if we have a valid callSid and streamSid
+                    if (!callSid) {
+                        console.log('Cannot forward call: Call SID not available');
+                        return;
+                    }
+
+                    if (!streamSid) {
+                        console.log('Cannot forward call: Stream SID not available');
+                        return;
+                    }
+
+                    // Set the flag BEFORE attempting transfer to prevent loops
+                    typedFunc.transferAttempted = callSid;
+
+                    // Attempt to transfer the call with non-null values
+                    await transferCallToAgent(openAiWs, callSid, streamSid, conversationState, addToTranscript);
+
+                    // Mark that the call requires human followup
+                    conversationState.requiresHumanFollowup = true;
+
+                    console.log('Call forwarded successfully');
+                } catch (error) {
+                    console.error('Error forwarding call:', error);
+
+                    // Even if the transfer failed, don't retry automatically
+                    // This prevents the infinite loop
+                    console.log('Will not attempt to transfer this call again automatically');
+                }
+            } else {
+                console.log('Call does not need to be forwarded at this time');
             }
         }
 
@@ -872,6 +927,8 @@ Remember: Always get the email first, then help with Kayako-related questions on
                         callRecorder = createCallRecorder(streamSid);
                         whisperAudioBuffer = []; // Initialize Whisper buffer
                         lastWhisperTranscriptionTime = Date.now();
+                        callForwardingChecked = false; // Reset call forwarding flag for new calls
+                        console.log('Reset callForwardingChecked flag for new call');
 
                         // Try to get the Call SID early
                         getCallSidFromStreamSid(streamSid)
@@ -913,15 +970,36 @@ Remember: Always get the email first, then help with Kayako-related questions on
                             if (transcription) {
                                 console.log('Whisper transcription:', transcription);
 
-                                // Add to transcript
-                                addToTranscript('user', transcription, 0.9); // Using high confidence as default
+                                // Calculate confidence based on content
+                                let confidence = 0.8; // Default confidence
 
-                                // Check for forwarding keywords
-                                if (containsHumanAgentRequest(transcription)) {
-                                    console.log('🔄 Forwarding keyword detected in Whisper transcription');
-                                    if (streamSid && !callForwardingChecked) {
-                                        checkAndHandleCallForwarding();
-                                    }
+                                // Check for human agent request keywords
+                                const humanAgentKeywords = [
+                                    'human', 'agent', 'person', 'representative', 'support', 'specialist',
+                                    'talk to', 'speak to', 'connect me', 'transfer me', 'real person'
+                                ];
+
+                                // Boost confidence if human agent keywords are detected
+                                const lowerTranscription = transcription.toLowerCase();
+                                const containsHumanRequest = humanAgentKeywords.some(keyword =>
+                                    lowerTranscription.includes(keyword)
+                                );
+
+                                if (containsHumanRequest) {
+                                    console.log('🔍 Potential human agent request detected in transcription');
+                                    confidence = 0.95; // Higher confidence for potential human requests
+                                }
+
+                                // Add to transcript
+                                addToTranscript('user', transcription, confidence);
+
+                                // If human request is detected, force a forwarding check
+                                if (containsHumanRequest) {
+                                    console.log('🔄 Forcing forwarding check due to potential human agent request');
+                                    // Reset the last check time to force a new check
+                                    lastForwardingCheckTime = 0;
+                                    // Check for forwarding immediately
+                                    checkAndHandleCallForwarding();
                                 }
                             }
                         });
@@ -1213,7 +1291,9 @@ async function analyzeConversationResolution(
         const formattedQuestions = questions.map((q, i) => `Question ${i + 1}: ${q}`).join('\n');
 
         // Use OpenAI to analyze the conversation
-        const openai = new OpenAI();
+        const openai = new OpenAI({
+            apiKey: process.env.OPENAI_API_KEY
+        });
         const response = await openai.chat.completions.create({
             model: "gpt-4-turbo-preview",
             messages: [
@@ -1358,7 +1438,9 @@ async function transcribeAudioFile(audioPath: string): Promise<string> {
     console.log('Transcribing audio file:', audioPath);
 
     try {
-        const openai = new OpenAI();
+        const openai = new OpenAI({
+            apiKey: process.env.OPENAI_API_KEY
+        });
         const transcription = await openai.audio.transcriptions.create({
             file: fs.createReadStream(audioPath),
             model: "whisper-1",
@@ -1378,7 +1460,9 @@ async function transcribeAudioFile(audioPath: string): Promise<string> {
  * Parse the audio transcript into structured conversation using OpenAI
  */
 async function parseTranscriptWithAI(transcript: string): Promise<Array<{ role: 'agent' | 'customer', text: string }>> {
-    const openai = new OpenAI();
+    const openai = new OpenAI({
+        apiKey: process.env.OPENAI_API_KEY
+    });
 
     const response = await openai.chat.completions.create({
         model: "gpt-4-turbo-preview",

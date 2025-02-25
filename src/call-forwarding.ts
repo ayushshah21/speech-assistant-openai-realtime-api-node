@@ -2,9 +2,15 @@ import WebSocket from 'ws';
 import pkg from 'twilio';
 const { Twilio } = pkg;
 import dotenv from 'dotenv';
+import { OpenAI } from 'openai';
 
 // Load environment variables
 dotenv.config();
+
+// Initialize OpenAI with API key from environment variables
+const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY
+});
 
 // Types
 export interface ConversationState {
@@ -46,156 +52,259 @@ const FORWARDING_THRESHOLD = parseInt(process.env.FORWARDING_THRESHOLD || '3', 1
 const twilioClient = new Twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 /**
- * Determines if a call should be forwarded to a human agent based on conversation context
+ * Evaluate if a call should be forwarded to a human agent using LLM
  * 
  * @param transcript - The conversation transcript
- * @param kbMatchFound - Whether a knowledge base match was found
- * @returns boolean indicating if the call should be forwarded
+ * @returns Promise with decision object containing shouldForward boolean and reason string
  */
-export function shouldForwardCall(
-    transcript: Array<{ role: string; content: string; timestamp?: number; confidence?: number; level?: string }>,
-    kbMatchFound: boolean
-): boolean {
-    if (!ENABLE_CALL_FORWARDING || !SUPPORT_AGENT_NUMBER) {
-        console.log('Call forwarding is disabled or support agent number not configured');
-        return false;
-    }
+export async function evaluateForwardingWithLLM(
+    transcript: Array<{ role: string; content: string; timestamp?: number; confidence?: number; level?: string }>
+): Promise<{
+    shouldForward: boolean;
+    reason: string;
+}> {
+    try {
+        // Get the last AI response if available
+        const aiResponses = transcript
+            .filter(msg => msg.role === 'assistant')
+            .map(msg => msg.content);
 
-    // Check for explicit requests to speak with a human agent
-    const lastUserMessages = transcript
-        .filter(msg => msg.role === 'user')
-        .slice(-3);
-
-    const requestsAgent = lastUserMessages.some(msg => {
-        const content = msg.content.toLowerCase();
-        return content.includes('speak to agent') ||
-            content.includes('talk to human') ||
-            content.includes('real person') ||
-            content.includes('speak with someone') ||
-            content.includes('human agent') ||
-            content.includes('transfer me') ||
-            content.includes('connect me to') ||
-            content.includes('speak to a human') ||
-            content.includes('talk to a person') ||
-            content.includes('speak with a representative') ||
-            content.includes('connect me with someone') ||
-            content.includes('need a human') ||
-            content.includes('want to talk to a human') ||
-            content.includes('agent please') ||
-            content.includes('representative') ||
-            content.includes('speak to support') ||
-            content.includes('talk to support') ||
-            content.includes('human support') ||
-            content.includes('need help from a person') ||
-            content.includes('can i speak to') ||
-            content.includes('can i talk to');
-    });
-
-    // Check for repeated failures or confusion
-    const repeatedFailures = checkForRepeatedFailures(transcript);
-
-    // Check for complex issue types
-    const complexIssueDetected = detectComplexIssue(transcript);
-
-    // Log the decision factors
-    console.log('Call forwarding decision factors:', {
-        requestsAgent,
-        kbMatchFound,
-        repeatedFailures,
-        complexIssueDetected
-    });
-
-    return requestsAgent || !kbMatchFound || repeatedFailures || complexIssueDetected;
-}
-
-/**
- * Check if there are repeated failures in the conversation
- * 
- * @param transcript - The conversation transcript
- * @returns boolean indicating if there are repeated failures
- */
-function checkForRepeatedFailures(transcript: Array<{ role: string; content: string; timestamp?: number; confidence?: number; level?: string }>): boolean {
-    // Count negative responses from the user
-    let negativeResponseCount = 0;
-    let consecutiveNegativeResponses = 0;
-
-    // Patterns indicating user frustration or confusion
-    const negativePatterns = [
-        'not what i',
-        'doesn\'t answer',
-        'didn\'t answer',
-        'not helpful',
-        'don\'t understand',
-        'not working',
-        'incorrect',
-        'wrong',
-        'no that\'s not',
-        'that doesn\'t help'
-    ];
-
-    // Analyze user messages for negative patterns
-    for (let i = 0; i < transcript.length; i++) {
-        const entry = transcript[i];
-        if (entry.role === 'user') {
-            const content = entry.content.toLowerCase();
-
-            const isNegative = negativePatterns.some(pattern => content.includes(pattern));
-
-            if (isNegative) {
-                negativeResponseCount++;
-                consecutiveNegativeResponses++;
-
-                // If we have multiple consecutive negative responses, that's a strong signal
-                if (consecutiveNegativeResponses >= 2) {
-                    return true;
-                }
-            } else {
-                consecutiveNegativeResponses = 0;
-            }
+        // If there are no AI responses yet, don't forward
+        if (aiResponses.length === 0) {
+            return {
+                shouldForward: false,
+                reason: "No AI responses yet to evaluate"
+            };
         }
-    }
 
-    // If total negative responses exceed our threshold, forward the call
-    return negativeResponseCount >= FORWARDING_THRESHOLD;
-}
+        // Get the most recent AI response
+        const lastAIResponse = aiResponses[aiResponses.length - 1];
 
-/**
- * Detect if the conversation involves a complex issue that requires human intervention
- * 
- * @param transcript - The conversation transcript
- * @returns boolean indicating if a complex issue is detected
- */
-function detectComplexIssue(transcript: Array<{ role: string; content: string; timestamp?: number; confidence?: number; level?: string }>): boolean {
-    // Keywords indicating complex issues
-    const complexIssueKeywords = [
-        'custom integration',
-        'api',
-        'billing',
-        'refund',
-        'cancel',
-        'subscription',
-        'legal',
-        'gdpr',
-        'data protection',
-        'security breach',
-        'urgent',
-        'emergency',
-        'critical',
-        'broken',
-        'not working at all'
-    ];
+        // Direct indicators that the AI is suggesting forwarding to a human
+        const forwardingPhrases = [
+            "connect you with a support specialist",
+            "transfer you to a human agent",
+            "connect you with a human",
+            "transfer your call",
+            "speak with a representative",
+            "connect you with an agent",
+            "transfer you to a specialist",
+            "put you in touch with our support team",
+            "escalate this to our support team",
+            "have a support agent contact you",
+            "I'll connect you with a support",
+            "I'll transfer you to",
+            "let me transfer you",
+            "I'll get a human agent",
+            "I'll have someone assist you",
+            "support specialist follow up with you",
+            "have a support specialist follow up",
+            "can't forward you directly",
+            "prefer to speak with a human agent",
+            "would like to speak with a human",
+            "understand you'd like to speak with a human"
+        ];
 
-    // Check user messages for complex issue keywords
-    for (const entry of transcript) {
-        if (entry.role === 'user') {
-            const content = entry.content.toLowerCase();
-            if (complexIssueKeywords.some(keyword => content.includes(keyword))) {
-                return true;
-            }
+        // Check if the AI's response directly indicates forwarding
+        const directForwardingIndicated = forwardingPhrases.some(phrase =>
+            lastAIResponse.toLowerCase().includes(phrase.toLowerCase())
+        );
+
+        if (directForwardingIndicated) {
+            return {
+                shouldForward: true,
+                reason: "AI response indicates forwarding is appropriate: " + lastAIResponse.substring(0, 100) + "..."
+            };
         }
-    }
 
-    return false;
+        // Check if the AI is indicating it can't help
+        const cannotHelpPhrases = [
+            "I don't have that information",
+            "I don't have access to",
+            "I'm unable to assist with",
+            "I can't access your account",
+            "I don't have the ability to",
+            "that's beyond my capabilities",
+            "I'm not able to help with",
+            "would require human assistance",
+            "I don't have specific information",
+            "I don't have enough information",
+            "I cannot access your personal",
+            "I don't have access to your specific",
+            "I cannot view your account",
+            "I'm not able to see your",
+            "I cannot perform that action",
+            "I'm limited in what I can do",
+            "I cannot make changes to your account",
+            "I don't have the authorization to"
+        ];
+
+        const aiCannotHelp = cannotHelpPhrases.some(phrase =>
+            lastAIResponse.toLowerCase().includes(phrase.toLowerCase())
+        );
+
+        // Phrases that should NOT trigger forwarding (routine conversation)
+        const routineConversationPhrases = [
+            "provide your email",
+            "may I have your email",
+            "could you share your email",
+            "what's your email",
+            "what is your email",
+            "could I get your email",
+            "can I get your email",
+            "follow up if needed",
+            "for our records",
+            "to keep you updated",
+            "to send you updates",
+            "to contact you later",
+            "to send you a confirmation",
+            "is there anything else",
+            "can I help you with anything else",
+            "is there something else",
+            "would you like me to help with anything else",
+            "do you have any other questions",
+            "is there anything else you'd like to know"
+        ];
+
+        // Check if this is just a routine email collection or conversation closing
+        const isRoutineConversation = routineConversationPhrases.some(phrase =>
+            lastAIResponse.toLowerCase().includes(phrase.toLowerCase())
+        );
+
+        // If this is just asking for an email or closing the conversation as part of normal flow, don't forward
+        if (isRoutineConversation && !directForwardingIndicated && !aiCannotHelp) {
+            return {
+                shouldForward: false,
+                reason: "AI is engaging in routine conversation (collecting information or closing)"
+            };
+        }
+
+        // Knowledge base indicators - phrases that suggest the AI is using the knowledge base
+        const kbIndicatorPhrases = [
+            "according to our knowledge base",
+            "based on our information",
+            "our documentation states",
+            "our records show",
+            "our knowledge base indicates",
+            "according to our documentation",
+            "our support documentation",
+            "our help center",
+            "our support articles",
+            "our guide explains",
+            "our FAQ states",
+            "as mentioned in our documentation",
+            "as outlined in our guide",
+            "as described in our help center"
+        ];
+
+        const isUsingKnowledgeBase = kbIndicatorPhrases.some(phrase =>
+            lastAIResponse.toLowerCase().includes(phrase.toLowerCase())
+        );
+
+        // If the AI is clearly using the knowledge base, don't forward
+        if (isUsingKnowledgeBase && !directForwardingIndicated && !aiCannotHelp) {
+            return {
+                shouldForward: false,
+                reason: "AI is providing information from the knowledge base"
+            };
+        }
+
+        if (aiCannotHelp) {
+            return {
+                shouldForward: true,
+                reason: "AI indicates it cannot help with this request: " + lastAIResponse.substring(0, 100) + "..."
+            };
+        }
+
+        // Check if the AI is providing a substantive answer
+        // If the response is longer and doesn't contain forwarding or inability phrases,
+        // it's likely providing a real answer
+        const isSubstantiveAnswer = lastAIResponse.length > 100 &&
+            !directForwardingIndicated &&
+            !aiCannotHelp;
+
+        if (isSubstantiveAnswer) {
+            return {
+                shouldForward: false,
+                reason: "AI is providing a substantive answer to the user's question"
+            };
+        }
+
+        // If we're not sure, use the LLM to evaluate
+        const formattedTranscript = transcript
+            .map(msg => `${msg.role.toUpperCase()}: ${msg.content}`)
+            .join('\n');
+
+        // Create a focused prompt for evaluating the AI's response
+        const prompt = `
+You are evaluating an AI assistant's response to determine if a call should be forwarded to a human agent.
+
+Conversation transcript:
+${formattedTranscript}
+
+Focus EXCLUSIVELY on the AI ASSISTANT's responses, not the user's questions. Determine if:
+1. The AI is clearly indicating it will transfer the call or connect the user with a human
+2. The AI is stating it cannot help with the request or lacks necessary information
+3. The AI is providing a substantive, helpful answer to the user's question
+
+IMPORTANT GUIDELINES:
+- If the AI's response mentions transferring, connecting to a specialist, or similar phrases, recommend forwarding
+- If the AI indicates it cannot help or lacks information, recommend forwarding
+- If the AI is providing a real answer that addresses the user's question, do NOT recommend forwarding
+- If the AI is simply asking for contact information (email, name, etc.) as part of normal conversation, do NOT recommend forwarding
+- If the AI is asking "is there anything else I can help with" or similar closing phrases, do NOT recommend forwarding
+- If the AI is providing information from a knowledge base (mentions documentation, guides, FAQs, etc.), do NOT recommend forwarding
+- If the AI is helping with password reset instructions or other common support tasks, do NOT recommend forwarding
+- Asking for an email "to follow up if needed" is normal conversation flow and should NOT trigger forwarding
+- Ignore the user's request content - focus ONLY on what the AI has responded with
+
+CRITICAL: Be conservative about recommending forwarding. Only recommend forwarding if the AI is CLEARLY indicating it cannot help or is explicitly suggesting a transfer.
+
+Respond with JSON only in this format:
+{"shouldForward": boolean, "reason": "brief explanation focusing on the AI's response"}
+`;
+
+        // Call OpenAI to evaluate the conversation
+        const openai = new OpenAI({
+            apiKey: process.env.OPENAI_API_KEY,
+        });
+
+        const response = await openai.chat.completions.create({
+            model: "gpt-4-turbo",
+            messages: [
+                { role: "system", content: prompt }
+            ],
+            temperature: 0.1,
+            max_tokens: 150,
+            response_format: { type: "json_object" }
+        });
+
+        const responseText = response.choices[0].message.content || '';
+        console.log('LLM evaluation response:', responseText);
+
+        try {
+            // Parse the JSON response
+            const result = JSON.parse(responseText);
+            return {
+                shouldForward: result.shouldForward,
+                reason: result.reason
+            };
+        } catch (error) {
+            console.error('Error parsing LLM response:', error);
+            // Default to not forwarding if we can't parse the response
+            return {
+                shouldForward: false,
+                reason: "Error evaluating forwarding decision"
+            };
+        }
+    } catch (error) {
+        console.error('Error in evaluateForwardingWithLLM:', error);
+        // Default to not forwarding on error
+        return {
+            shouldForward: false,
+            reason: "Error in forwarding evaluation"
+        };
+    }
 }
 
 /**
