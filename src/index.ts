@@ -1877,6 +1877,85 @@ async function createKayakoTicket(conversation: ConversationState, mp3Path?: str
     }
 }
 
+/**
+ * Generate a descriptive subject line using LLM based on conversation content
+ * 
+ * @param transcript - The conversation transcript
+ * @param parsedTranscript - Optional parsed transcript from audio
+ * @returns Promise with a concise, descriptive subject line
+ */
+async function generateDescriptiveSubjectWithLLM(
+    transcript: Array<{ role: string; content: string; timestamp?: number }>,
+    parsedTranscript?: Array<{ role: 'agent' | 'customer', text: string }>
+): Promise<string> {
+    try {
+        // Default subject if LLM call fails
+        const defaultSubject = 'Kayako Support Conversation';
+
+        // Format the transcript for the LLM
+        let formattedTranscript: string;
+
+        // If we have a parsed transcript from audio, use that as it's likely more accurate
+        if (parsedTranscript && parsedTranscript.length > 0) {
+            formattedTranscript = parsedTranscript
+                .map(entry => `${entry.role === 'customer' ? 'Customer' : 'Agent'}: ${entry.text}`)
+                .join('\n');
+        } else {
+            // Otherwise use the regular transcript
+            formattedTranscript = transcript
+                .map(entry => `${entry.role === 'user' ? 'Customer' : 'Agent'}: ${entry.content}`)
+                .join('\n');
+        }
+
+        // Use OpenAI to generate a subject
+        const openai = new OpenAI({
+            apiKey: process.env.OPENAI_API_KEY
+        });
+
+        const response = await openai.chat.completions.create({
+            model: "gpt-4-turbo-preview",
+            messages: [
+                {
+                    role: "system",
+                    content: `You are an expert at creating concise, descriptive email subject lines for customer support tickets.
+                    Your task is to analyze a conversation transcript between a customer and a Kayako support agent.
+                    Create a 5-6 word subject line that clearly describes the main topic or question discussed.
+                    The subject should be specific enough that someone can understand what the conversation was about.
+                    Focus on Kayako-specific topics like SSO, password reset, branding, administration, etc.
+                    DO NOT use generic subjects like "Customer Support" or "Help Request".
+                    DO NOT include phrases like "Re:" or "Subject:".
+                    Just return the subject line text with no additional explanation or formatting.`
+                },
+                {
+                    role: "user",
+                    content: `Please create a concise, descriptive subject line (5-6 words) for this customer support conversation:
+                    
+                    TRANSCRIPT:
+                    ${formattedTranscript}`
+                }
+            ],
+            temperature: 0.3,
+            max_tokens: 50
+        });
+
+        // Get the subject from the response
+        const subject = response.choices[0].message.content?.trim() || defaultSubject;
+
+        // Log the generated subject
+        console.log('LLM generated subject:', subject);
+
+        // Ensure the subject isn't too long
+        if (subject.length > 70) {
+            return subject.substring(0, 67) + '...';
+        }
+
+        return subject;
+    } catch (error) {
+        console.error('Error generating subject with LLM:', error);
+        return 'Kayako Support Conversation';
+    }
+}
+
 // Update generateTicketSummary to accept parsedTranscript as an optional parameter
 async function generateTicketSummary(
     conversation: ConversationState,
@@ -2032,21 +2111,11 @@ async function generateTicketSummary(
         priority = 'LOW'; // Low priority for fully resolved conversations with positive acknowledgment
     }
 
-    // Generate subject from first meaningful user message
-    let subject = 'New Support Call';
-
-    // If we have parsed transcript and no meaningful user message, use the first customer message
-    if (parsedTranscript && parsedTranscript.length > 0 && userMessages.length === 0) {
-        const firstCustomerMsg = parsedTranscript.find(msg => msg.role === 'customer');
-        if (firstCustomerMsg) {
-            subject = firstCustomerMsg.text.substring(0, 100);
-        }
-    } else if (userMessages.length > 0) {
-        const firstMeaningful = userMessages.find(msg => !msg.match(/^[\\w.-]+@[\\w.-]+\\.\w+$/));
-        if (firstMeaningful) {
-            subject = firstMeaningful.substring(0, 100);
-        }
-    }
+    // Generate a descriptive subject using LLM
+    const subject = await generateDescriptiveSubjectWithLLM(
+        conversation.transcript,
+        parsedTranscript
+    );
 
     // Generate more detailed summary
     let summary = '';
