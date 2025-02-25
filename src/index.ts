@@ -10,6 +10,10 @@ import FormData from 'form-data';
 import { OpenAI } from 'openai';
 import https from 'https';
 import http from 'http';
+import { shouldForwardCall, transferCallToAgent, getCallSidFromStreamSid } from './call-forwarding.js';
+import pkg from 'twilio';
+import os from 'os';
+const { Twilio } = pkg;
 
 // Load environment variables
 dotenv.config();
@@ -20,7 +24,9 @@ const requiredEnvVars = [
     'PORT',
     'KAYAKO_API_URL',
     'KAYAKO_USERNAME',
-    'KAYAKO_PASSWORD'
+    'KAYAKO_PASSWORD',
+    'TWILIO_ACCOUNT_SID',
+    'TWILIO_AUTH_TOKEN'
 ] as const;
 for (const envVar of requiredEnvVars) {
     if (!process.env[envVar]) {
@@ -290,8 +296,8 @@ function extractEmail(text: string): string | null {
     return null;
 }
 
-// Helper: extract email from an array of messages
-function extractEmailFromMessages(messages: string[]): string | null {
+// Helper: extract email from an array of string messages
+function extractEmailFromStringArray(messages: string[]): string | null {
     for (const msg of messages) {
         const email = extractEmail(msg);
         if (email) {
@@ -299,6 +305,145 @@ function extractEmailFromMessages(messages: string[]): string | null {
         }
     }
     return null;
+}
+
+// Helper: extract email from an array of transcript messages
+function extractEmailFromMessages(messages: Array<{ role: 'user' | 'assistant', content: string, timestamp: number, confidence?: number, level?: ConfidenceLevel }>): string | null {
+    for (const msg of messages) {
+        const email = extractEmail(msg.content);
+        if (email) {
+            return email;
+        }
+    }
+    return null;
+}
+
+// Initialize Twilio client
+const twilioClient = new Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+
+// Buffer for collecting audio for Whisper transcription
+let whisperAudioBuffer: Buffer[] = [];
+let lastWhisperTranscriptionTime = 0;
+const WHISPER_TRANSCRIPTION_INTERVAL = 3000; // 3 seconds
+
+/**
+ * Check if a message contains a request to speak with a human agent
+ * 
+ * @param message - The message to check
+ * @returns boolean indicating if the message contains a request to speak with a human agent
+ */
+function containsHumanAgentRequest(message: string): boolean {
+    if (!message) return false;
+
+    const lowerMessage = message.toLowerCase();
+    const humanRequestPhrases = [
+        'speak to agent',
+        'talk to human',
+        'real person',
+        'speak with someone',
+        'human agent',
+        'transfer me',
+        'connect me to',
+        'speak to a human',
+        'talk to a person',
+        'speak with a representative',
+        'connect me with someone',
+        'need a human',
+        'want to talk to a human',
+        'agent please',
+        'representative',
+        'speak to support',
+        'talk to support',
+        'human support',
+        'need help from a person',
+        'can i speak to',
+        'can i talk to'
+    ];
+
+    return humanRequestPhrases.some(phrase => lowerMessage.includes(phrase));
+}
+
+/**
+ * Process audio with Whisper API for more accurate transcription
+ * 
+ * @param audioBuffer - Array of audio buffers to process
+ * @returns Transcription text or null if processing failed
+ */
+async function processAudioWithWhisper(audioBuffer: Buffer[]): Promise<string | null> {
+    if (!audioBuffer.length) return null;
+
+    try {
+        // Create a temporary file for the audio
+        const tempFilePath = path.join(os.tmpdir(), `whisper-${Date.now()}.wav`);
+
+        // G711 ulaw to linear PCM conversion table (defined at the top of the file)
+        // Using the existing ULAW_TO_LINEAR table from the module scope
+
+        // Convert audio buffers to PCM
+        const pcmBuffers = audioBuffer.map(buffer => {
+            // Convert ulaw to PCM
+            const pcmData = Buffer.alloc(buffer.length * 2);
+            for (let i = 0; i < buffer.length; i++) {
+                // Simple ulaw to PCM conversion
+                const sample = buffer[i] === 0xFF ? 0 : (buffer[i] ^ 0xFF) << 2;
+                pcmData.writeInt16LE(sample, i * 2);
+            }
+            return pcmData;
+        });
+
+        // Combine PCM buffers
+        const combinedPcm = Buffer.concat(pcmBuffers);
+
+        // Create WAV header
+        const wavHeader = Buffer.alloc(44);
+
+        // RIFF header
+        wavHeader.write('RIFF', 0);
+        wavHeader.writeUInt32LE(36 + combinedPcm.length, 4);
+        wavHeader.write('WAVE', 8);
+
+        // fmt subchunk
+        wavHeader.write('fmt ', 12);
+        wavHeader.writeUInt32LE(16, 16);
+        wavHeader.writeUInt16LE(1, 20); // PCM format
+        wavHeader.writeUInt16LE(1, 22); // Mono
+        wavHeader.writeUInt32LE(8000, 24); // Sample rate
+        wavHeader.writeUInt32LE(8000 * 2, 28); // Byte rate
+        wavHeader.writeUInt16LE(2, 32); // Block align
+        wavHeader.writeUInt16LE(16, 34); // Bits per sample
+
+        // data subchunk
+        wavHeader.write('data', 36);
+        wavHeader.writeUInt32LE(combinedPcm.length, 40);
+
+        // Write WAV file
+        fs.writeFileSync(tempFilePath, Buffer.concat([wavHeader, combinedPcm]));
+
+        // Call Whisper API using the OpenAI instance
+        const openaiInstance = new OpenAI();
+        const transcription = await openaiInstance.audio.transcriptions.create({
+            file: fs.createReadStream(tempFilePath),
+            model: 'whisper-1',
+            language: 'en',
+            response_format: 'json'
+        });
+
+        // Clean up temp file
+        fs.unlinkSync(tempFilePath);
+
+        // Check if the transcription contains a request to speak with a human agent
+        // This check will be done in the WebSocket handler where we have access to
+        // streamSid and callForwardingChecked variables
+        if (transcription.text && containsHumanAgentRequest(transcription.text)) {
+            console.log('🔍 Whisper detected human agent request:', transcription.text);
+            // The actual forwarding will be handled by the caller of this function
+        }
+
+        return transcription.text;
+    } catch (error) {
+        console.error('Error processing audio with Whisper:', error);
+        return null;
+    }
 }
 
 // Root route
@@ -340,12 +485,14 @@ fastify.register(async (fastify: FastifyInstance) => {
         };
 
         let streamSid: string | null = null;
+        let callSid: string | null = null;
         let latestMediaTimestamp = 0;
         let lastAssistantItem: string | null = null;
         let markQueue: string[] = [];
         let responseStartTimestampTwilio: number | null = null;
         let lastSpeechStartTime = 0;
         let isResponseFullyDone = false;
+        let callForwardingChecked = false;
 
         // Initialize conversation state
         const conversationState: ConversationState = {
@@ -471,7 +618,7 @@ Remember: Always get the email first, then help with Kayako-related questions on
 
             // Check for email in user messages
             if (role === 'user' && !conversationState.userDetails.hasProvidedEmail) {
-                const email = extractEmail(content);
+                const email = extractEmailFromStringArray(conversationState.transcript.map(e => e.content));
                 if (email) {
                     console.log('📧 Found email:', email);
                     conversationState.userDetails.email = email;
@@ -479,9 +626,102 @@ Remember: Always get the email first, then help with Kayako-related questions on
                 }
             }
 
+            // Check if we should forward the call to a human agent
+            if (role === 'user' && streamSid && !callForwardingChecked && conversationState.transcript.length >= 4) {
+                checkAndHandleCallForwarding();
+            }
+
             console.log('Current transcript length:', conversationState.transcript.length);
             console.log('Current raw input length:', conversationState.rawUserInput.length);
             console.log('=== END ADDING TO TRANSCRIPT ===\n');
+        }
+
+        // Function to check if call should be forwarded and handle the forwarding
+        async function checkAndHandleCallForwarding() {
+            if (!streamSid) {
+                console.log('❌ Cannot check call forwarding: Stream SID not available');
+                return;
+            }
+
+            if (callForwardingChecked) {
+                console.log('ℹ️ Call forwarding already checked for this call');
+                return;
+            }
+
+            console.log('🔍 Checking if call should be forwarded...');
+            console.log(`- Stream SID: ${streamSid}`);
+            console.log(`- KB Match Found: ${conversationState.kbMatchFound}`);
+            console.log(`- Transcript Length: ${conversationState.transcript.length}`);
+
+            // Mark as checked to prevent multiple checks
+            callForwardingChecked = true;
+
+            try {
+                // Check if we should forward the call based on conversation context
+                const shouldForward = shouldForwardCall(
+                    conversationState.transcript,
+                    conversationState.kbMatchFound
+                );
+
+                if (shouldForward) {
+                    console.log('🔄 Call forwarding criteria met, initiating transfer');
+
+                    // Get the Call SID if we don't have it yet
+                    if (!callSid) {
+                        console.log(`Retrieving Call SID from Stream SID: ${streamSid}`);
+                        callSid = await getCallSidFromStreamSid(streamSid);
+                        console.log(`Retrieved Call SID: ${callSid || 'null'}`);
+                    }
+
+                    // Set flag to indicate human followup is needed
+                    conversationState.requiresHumanFollowup = true;
+                    console.log('Set requiresHumanFollowup flag to true');
+
+                    // Inform the user that we're transferring them
+                    addToTranscript(
+                        'assistant',
+                        `I'll connect you with a support specialist who can better assist you with this issue. Please hold while I transfer your call.`
+                    );
+
+                    // Try to transfer the call if we have a Call SID
+                    if (callSid) {
+                        // Transfer the call
+                        console.log(`Transferring call ${callSid} to human agent...`);
+                        try {
+                            await transferCallToAgent(
+                                connection,
+                                callSid,
+                                streamSid,
+                                conversationState,
+                                addToTranscript
+                            );
+                            console.log('Call transfer process completed');
+                        } catch (transferError) {
+                            console.error('❌ Error in call transfer:', transferError);
+
+                            // Add message to transcript if not already added by transferCallToAgent
+                            if (connection.readyState === WebSocket.OPEN) {
+                                addToTranscript(
+                                    'assistant',
+                                    `I'm sorry, I'm having trouble connecting you with a specialist. Please try calling our support line directly at ${process.env.SUPPORT_AGENT_NUMBER || 'our support number'}.`
+                                );
+                            }
+                        }
+                    } else {
+                        console.error('❌ Cannot forward call: Call SID not available');
+                        // Add message to transcript
+                        addToTranscript(
+                            'assistant',
+                            `I'm sorry, I'm having trouble connecting you with a specialist. Please try calling our support line directly at ${process.env.SUPPORT_AGENT_NUMBER || 'our support number'}.`
+                        );
+                    }
+                } else {
+                    console.log('✅ Call forwarding not needed at this time');
+                }
+            } catch (error) {
+                console.error('❌ Error in call forwarding process:', error);
+                // Don't reset callForwardingChecked flag to prevent infinite loops
+            }
         }
 
         // Initialize Realtime session
@@ -630,6 +870,18 @@ Remember: Always get the email first, then help with Kayako-related questions on
                     streamSid = data.start?.streamSid || null;
                     if (streamSid) {
                         callRecorder = createCallRecorder(streamSid);
+                        whisperAudioBuffer = []; // Initialize Whisper buffer
+                        lastWhisperTranscriptionTime = Date.now();
+
+                        // Try to get the Call SID early
+                        getCallSidFromStreamSid(streamSid)
+                            .then(sid => {
+                                if (sid) {
+                                    callSid = sid;
+                                    console.log('Retrieved Call SID:', callSid);
+                                }
+                            })
+                            .catch(err => console.error('Error getting Call SID:', err));
                     }
                     console.log('=== END CALL STARTED ===\n');
                 }
@@ -641,6 +893,38 @@ Remember: Always get the email first, then help with Kayako-related questions on
                     // Add to recorder
                     if (callRecorder) {
                         callRecorder.addUserAudio(data.media.payload);
+                    }
+
+                    // Add to Whisper buffer
+                    const audioChunk = Buffer.from(data.media.payload, 'base64');
+                    whisperAudioBuffer.push(audioChunk);
+
+                    // Process with Whisper periodically
+                    const now = Date.now();
+                    if (now - lastWhisperTranscriptionTime > WHISPER_TRANSCRIPTION_INTERVAL && whisperAudioBuffer.length > 0) {
+                        lastWhisperTranscriptionTime = now;
+
+                        // Clone and clear buffer
+                        const bufferToProcess = [...whisperAudioBuffer];
+                        whisperAudioBuffer = [];
+
+                        // Process with Whisper
+                        processAudioWithWhisper(bufferToProcess).then(transcription => {
+                            if (transcription) {
+                                console.log('Whisper transcription:', transcription);
+
+                                // Add to transcript
+                                addToTranscript('user', transcription, 0.9); // Using high confidence as default
+
+                                // Check for forwarding keywords
+                                if (containsHumanAgentRequest(transcription)) {
+                                    console.log('🔄 Forwarding keyword detected in Whisper transcription');
+                                    if (streamSid && !callForwardingChecked) {
+                                        checkAndHandleCallForwarding();
+                                    }
+                                }
+                            }
+                        });
                     }
 
                     // Send to OpenAI
@@ -1593,7 +1877,7 @@ async function generateTicketSummary(
 
     // If still no email, try to extract from all messages
     if (!email) {
-        email = extractEmailFromMessages(allMessages) || null;
+        email = extractEmailFromStringArray(allMessages) || null;
     }
 
     console.log('Final email determined for ticket:', email);
