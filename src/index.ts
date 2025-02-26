@@ -553,8 +553,9 @@ IMPORTANT GUIDELINES:
    - Use the knowledge base information to provide accurate answers
    - If you don't find a specific answer in the knowledge base, say:
      "I don't have specific information about that aspect of Kayako. I'll have a support specialist follow up with you at [email]."
-   - If the user asks to speak with a human agent at any point, acknowledge their request and say:
-     "I understand you'd like to speak with a human agent. I'll connect you with a support specialist right away."
+   - If the user asks to speak with a human agent at any point, acknowledge their request but DO NOT say you'll transfer them. Simply say:
+     "I understand you'd like to speak with a human agent."
+     Then STOP speaking and wait for the system to handle the transfer.
 
 Remember: Always get the email first, then help with Kayako-related questions only. Users can request a human agent at any time by saying "speak to a human" or "talk to an agent".`;
 
@@ -700,6 +701,11 @@ Remember: Always get the email first, then help with Kayako-related questions on
                 .filter(msg => msg.role === 'assistant')
                 .map(msg => msg.content);
 
+            // Check if the AI has already acknowledged a human agent request
+            const aiAcknowledgedRequest = aiResponses.some(response => {
+                return response.toLowerCase().includes('understand you\'d like to speak with a human agent');
+            });
+
             const aiIndicatesForwarding = aiResponses.some(response => {
                 return response.toLowerCase().includes('human agent') ||
                     response.toLowerCase().includes('support specialist') ||
@@ -715,6 +721,10 @@ Remember: Always get the email first, then help with Kayako-related questions on
 
             if (aiIndicatesForwarding) {
                 console.log('AI response indicates forwarding is appropriate');
+            }
+
+            if (aiAcknowledgedRequest) {
+                console.log('AI has already acknowledged human agent request');
             }
 
             // Start with forwarding criteria
@@ -760,8 +770,29 @@ Remember: Always get the email first, then help with Kayako-related questions on
                     // Set the flag BEFORE attempting transfer to prevent loops
                     typedFunc.transferAttempted = callSid;
 
+                    // Wait for AI to finish speaking if it's currently speaking
+                    if (isSpeaking) {
+                        console.log('AI is currently speaking, waiting for it to finish before initiating transfer...');
+                        // Wait for a short time to allow the AI to finish its current sentence
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                    }
+
+                    // If the AI has already acknowledged the request, we don't need to send another acknowledgment
+                    // This prevents the interruption issue
+                    const skipAcknowledgment = aiAcknowledgedRequest;
+
                     // Attempt to transfer the call with non-null values
-                    await transferCallToAgent(openAiWs, callSid, streamSid, conversationState, addToTranscript);
+                    // Pass the current speaking state and response completion state
+                    await transferCallToAgent(
+                        openAiWs,
+                        callSid,
+                        streamSid,
+                        conversationState,
+                        addToTranscript,
+                        isSpeaking,
+                        isResponseFullyDone,
+                        skipAcknowledgment
+                    );
 
                     // Mark that the call requires human followup
                     conversationState.requiresHumanFollowup = true;
@@ -881,6 +912,13 @@ Remember: Always get the email first, then help with Kayako-related questions on
 
                 // Record AI audio
                 if (response.type === 'response.audio.delta' && response.delta) {
+                    // When AI starts sending audio, it's speaking
+                    if (!isSpeaking) {
+                        console.log('🔊 AI started speaking');
+                        isSpeaking = true;
+                        isResponseFullyDone = false;
+                    }
+
                     if (callRecorder) {
                         callRecorder.addAIAudio(response.delta);
                     }
@@ -899,6 +937,13 @@ Remember: Always get the email first, then help with Kayako-related questions on
                         lastAssistantItem = response.item_id;
                     }
                     sendMark(connection, streamSid!);
+                }
+
+                // Track when AI response is complete
+                if (response.type === 'response.done' || response.type === 'response.audio.done') {
+                    console.log('🔊 AI finished speaking');
+                    isSpeaking = false;
+                    isResponseFullyDone = true;
                 }
 
                 // Speech started event
@@ -1101,7 +1146,10 @@ Remember: Always get the email first, then help with Kayako-related questions on
         function handleSpeechStartedEvent(): void {
             if (Date.now() - lastSpeechStartTime < 500) return;
             lastSpeechStartTime = Date.now();
-            isSpeaking = true;
+
+            // This is for user speaking, not AI speaking
+            // We need to track user speaking separately from AI speaking
+            // isSpeaking is used for AI speaking state
 
             // Start new speech segment
             currentSpeechSegment = {
@@ -1126,6 +1174,9 @@ Remember: Always get the email first, then help with Kayako-related questions on
                 console.log('Barge-in: truncated AI response');
                 lastAssistantItem = null;
 
+                // When user interrupts AI, mark AI as not speaking
+                isSpeaking = false;
+
                 if (streamSid) {
                     connection.send(JSON.stringify({
                         event: 'clear',
@@ -1137,12 +1188,13 @@ Remember: Always get the email first, then help with Kayako-related questions on
 
         // Add speech end detection
         function handleSpeechEndedEvent(): void {
-            if (!isSpeaking || !currentSpeechSegment) {
+            // This function is for ending user speech segments, not AI speech
+            // Don't check or modify isSpeaking (which is for AI)
+            if (!currentSpeechSegment) {
                 console.log('❌ Cannot end speech segment: no active segment');
                 return;
             }
 
-            isSpeaking = false;
             const endTime = Date.now();
             const duration = (endTime - currentSpeechSegment.startTime) / 1000;
 

@@ -315,13 +315,19 @@ Respond with JSON only in this format:
  * @param streamSid - The Twilio Stream SID
  * @param conversationState - The current conversation state
  * @param addToTranscript - Function to add messages to the transcript
+ * @param isSpeaking - Optional flag indicating if the AI is currently speaking
+ * @param isResponseFullyDone - Optional flag indicating if the AI's response is complete
+ * @param skipAcknowledgment - Optional flag to skip sending the acknowledgment message
  */
 export async function transferCallToAgent(
     connection: WebSocket,
     callSid: string,
     streamSid: string,
     conversationState: ConversationState,
-    addToTranscript: (role: 'user' | 'assistant', content: string, confidence?: number) => void
+    addToTranscript: (role: 'user' | 'assistant', content: string, confidence?: number) => void,
+    isSpeaking?: boolean,
+    isResponseFullyDone?: boolean,
+    skipAcknowledgment?: boolean
 ): Promise<void> {
     try {
         console.log(`Initiating call transfer process:`);
@@ -329,19 +335,46 @@ export async function transferCallToAgent(
         console.log(`- Stream SID: ${streamSid}`);
         console.log(`- Support Agent Number: ${SUPPORT_AGENT_NUMBER}`);
         console.log(`- WebSocket State: ${connection.readyState === WebSocket.OPEN ? 'OPEN' : 'NOT_OPEN'}`);
+        console.log(`- AI Speaking: ${isSpeaking ? 'Yes' : 'No'}`);
+        console.log(`- Response Fully Done: ${isResponseFullyDone ? 'Yes' : 'No'}`);
+        console.log(`- Skip Acknowledgment: ${skipAcknowledgment ? 'Yes' : 'No'}`);
 
-        // 1. Inform the user about the transfer
-        const transferMessage = "I'll connect you with a support specialist who can better assist you with this issue. Please hold while I transfer your call.";
+        // If the AI is currently speaking, wait for a short time to allow it to finish
+        // This helps prevent interrupting the AI mid-sentence
+        if (isSpeaking === true) {
+            console.log('AI is currently speaking. Waiting briefly before initiating transfer...');
+            // Wait for a short time (1.5 seconds) to allow the AI to finish its current sentence
+            await new Promise(resolve => setTimeout(resolve, 1500));
+            console.log('Wait complete, proceeding with transfer');
+        }
 
-        // 2. Add the transfer message to the transcript
-        addToTranscript('assistant', transferMessage);
-        console.log('Added transfer message to transcript');
+        // Only send the transfer message if we're not skipping the acknowledgment
+        if (!skipAcknowledgment) {
+            // 1. Inform the user about the transfer with a clear, complete message
+            const transferMessage = "I understand you'd like to speak with a human agent. I'll connect you with a support specialist who can better assist you with this issue. Please hold while I transfer your call.";
+
+            // 2. Add the transfer message to the transcript
+            addToTranscript('assistant', transferMessage);
+            console.log('Added transfer message to transcript');
+        } else {
+            console.log('Skipping acknowledgment message as AI has already acknowledged the request');
+
+            // Add just the transfer part to the transcript
+            const transferOnlyMessage = "I'll connect you with a support specialist who can better assist you with this issue. Please hold while I transfer your call.";
+            addToTranscript('assistant', transferOnlyMessage);
+            console.log('Added transfer-only message to transcript');
+        }
 
         // 3. Generate a summary of the conversation for the agent
         const conversationSummary = generateConversationSummary(conversationState);
         console.log('Generated conversation summary for agent');
 
-        // 4. Execute the transfer via Twilio API
+        // 4. Add a natural pause before executing the transfer
+        // This creates a more natural conversational flow
+        console.log('Adding a brief pause before executing transfer...');
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // 5. Execute the transfer via Twilio API
         console.log('Executing call transfer via Twilio API...');
 
         try {
