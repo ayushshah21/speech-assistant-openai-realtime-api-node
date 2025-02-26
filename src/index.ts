@@ -176,7 +176,7 @@ fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
 // Constants
-const VOICE = 'alloy';
+const VOICE = 'sage';
 const PORT = process.env.PORT || 5050;
 const MAX_CHUNK_SIZE = 8192; // Maximum for Twilio audio
 const SHOW_TIMING_MATH = false;
@@ -1647,10 +1647,6 @@ async function createKayakoTicket(conversation: ConversationState, mp3Path?: str
         const ticketInfo = await generateTicketSummary(conversation, parsedTranscript);
         console.log('Generated ticket info:', ticketInfo);
 
-        // Skip MP3 file upload entirely
-        let attachmentId = '';
-        console.log('Skipping call recording upload to avoid attachment issues');
-
         if (ticketInfo.email && !conversation.userDetails.email) {
             conversation.userDetails.email = ticketInfo.email;
             conversation.userDetails.hasProvidedEmail = true;
@@ -1816,60 +1812,125 @@ async function createKayakoTicket(conversation: ConversationState, mp3Path?: str
             'LOW': '1'     // Low priority
         };
 
-        const ticket: KayakoTicket = {
-            field_values: {
-                product: "80"
-            },
-            status_id: "1",
-            attachment_file_ids: [], // Empty array instead of using attachmentId
-            tags: "gauntlet-ai",
-            type_id: 7,
-            channel: "MAIL",
-            subject: ticketInfo.subject,
-            contents: ticketContent,
-            assigned_agent_id: KAYAKO_CONFIG.defaultAgent,
-            assigned_team_id: KAYAKO_CONFIG.defaultTeam,
-            // TODO: Future enhancement - Create a user in Kayako with the provided email
-            // Currently using default agent as requester, but ideally we would:
-            // 1. Check if a user with this email exists in Kayako
-            // 2. If not, create a new user with the email
-            // 3. Use that user's ID as the requester_id
-            requester_id: KAYAKO_CONFIG.defaultAgent, // Currently using default agent
-            channel_id: "1",
-            priority_id: priorityIdMap[ticketInfo.priority] || '2', // Default to medium if mapping fails
-            channel_options: {
-                cc: [],
-                html: true
+        // Check if we have an MP3 recording to attach
+        if (mp3Path && fs.existsSync(mp3Path)) {
+            console.log(`Attaching MP3 recording: ${mp3Path}`);
+
+            try {
+                // Create a form-data object for the multipart request
+                const formData = new FormData();
+
+                // Add all the ticket data fields
+                formData.append('subject', ticketInfo.subject);
+                formData.append('contents', ticketContent);
+                formData.append('channel', 'MAIL');
+                formData.append('channel_id', '1');
+                formData.append('tags', 'gauntlet-ai');
+                formData.append('type_id', '7');
+                formData.append('status_id', '1');
+                formData.append('priority_id', priorityIdMap[ticketInfo.priority] || '2');
+                formData.append('assigned_agent_id', KAYAKO_CONFIG.defaultAgent);
+                formData.append('assigned_team_id', KAYAKO_CONFIG.defaultTeam);
+                formData.append('requester_id', KAYAKO_CONFIG.defaultAgent);
+                formData.append('field_values[product]', '80');
+                formData.append('channel_options[html]', 'true');
+
+                // Add the MP3 file as an attachment - this is the key part
+                const fileStream = fs.createReadStream(mp3Path);
+                formData.append('attachment', fileStream, {
+                    filename: path.basename(mp3Path),
+                    contentType: 'audio/mpeg'
+                });
+
+                console.log('Sending multipart request to Kayako API with MP3 attachment');
+
+                // Get the form headers
+                const formHeaders = formData.getHeaders();
+
+                // Send the multipart request directly to the cases endpoint
+                const response = await fetch(`${KAYAKO_CONFIG.baseUrl}/cases`, {
+                    method: 'POST',
+                    headers: {
+                        ...formHeaders,
+                        Authorization: 'Basic ' + Buffer.from(`${KAYAKO_CONFIG.username}:${KAYAKO_CONFIG.password}`).toString('base64')
+                    },
+                    // @ts-ignore - FormData is compatible with fetch body
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    console.error('Failed to create ticket with attachment:', errorText);
+
+                    // Fall back to creating ticket without attachment
+                    console.log('Falling back to creating ticket without attachment');
+                    await createTicketWithoutAttachment();
+                } else {
+                    const responseData = await response.json();
+                    console.log('Kayako ticket created successfully with attachment:', responseData);
+                }
+            } catch (error) {
+                console.error('Error creating ticket with attachment:', error);
+                // Fall back to creating ticket without attachment
+                await createTicketWithoutAttachment();
             }
-        };
-
-        // If we have the user's email, add it to the cc field so they receive a copy of the ticket
-        if (ticketInfo.email) {
-            // Don't add to cc field as it's causing API validation errors
-            // Instead, we're already displaying it prominently in the ticket content
-            console.log(`Email ${ticketInfo.email} will be displayed in ticket content but not added to cc field`);
-            // Keep cc as an empty array to avoid validation errors
-            ticket.channel_options.cc = [];
+        } else {
+            // No MP3 file to attach, create ticket without attachment
+            await createTicketWithoutAttachment();
         }
 
-        console.log('Sending ticket to Kayako API:', JSON.stringify(ticket, null, 2));
+        // Helper function to create ticket without attachment
+        async function createTicketWithoutAttachment() {
+            const ticket: KayakoTicket = {
+                field_values: {
+                    product: "80"
+                },
+                status_id: "1",
+                attachment_file_ids: [], // Empty array instead of using attachmentId
+                tags: "gauntlet-ai",
+                type_id: 7,
+                channel: "MAIL",
+                subject: ticketInfo.subject,
+                contents: ticketContent,
+                assigned_agent_id: KAYAKO_CONFIG.defaultAgent,
+                assigned_team_id: KAYAKO_CONFIG.defaultTeam,
+                requester_id: KAYAKO_CONFIG.defaultAgent,
+                channel_id: "1",
+                priority_id: priorityIdMap[ticketInfo.priority] || '2',
+                channel_options: {
+                    cc: [],
+                    html: true
+                }
+            };
 
-        const response = await fetch(`${KAYAKO_CONFIG.baseUrl}/cases`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json; charset=UTF-8',
-                Authorization: 'Basic ' + Buffer.from(`${KAYAKO_CONFIG.username}:${KAYAKO_CONFIG.password}`).toString('base64')
-            },
-            body: JSON.stringify(ticket)
-        });
+            // If we have the user's email, add it to the cc field so they receive a copy of the ticket
+            if (ticketInfo.email) {
+                // Don't add to cc field as it's causing API validation errors
+                // Instead, we're already displaying it prominently in the ticket content
+                console.log(`Email ${ticketInfo.email} will be displayed in ticket content but not added to cc field`);
+                // Keep cc as an empty array to avoid validation errors
+                ticket.channel_options.cc = [];
+            }
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`Failed to create Kayako ticket. Status: ${response.status}. Response: ${errorText}`);
+            console.log('Sending ticket to Kayako API:', JSON.stringify(ticket, null, 2));
+
+            const response = await fetch(`${KAYAKO_CONFIG.baseUrl}/cases`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json; charset=UTF-8',
+                    Authorization: 'Basic ' + Buffer.from(`${KAYAKO_CONFIG.username}:${KAYAKO_CONFIG.password}`).toString('base64')
+                },
+                body: JSON.stringify(ticket)
+            });
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(`Failed to create Kayako ticket. Status: ${response.status}. Response: ${errorText}`);
+            }
+
+            const responseData = await response.json();
+            console.log('Kayako ticket created successfully:', responseData);
         }
-
-        const responseData = await response.json();
-        console.log('Kayako ticket created successfully:', responseData);
 
     } catch (error) {
         console.error('Error in createKayakoTicket:', error);
